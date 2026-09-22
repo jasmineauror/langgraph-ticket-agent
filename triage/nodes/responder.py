@@ -37,7 +37,7 @@ def respond(state: TicketState) -> TicketState:
         "cited_sources": result.get("cited_sources", []),
         "responder_refused": refused,
         "trace": [
-            f"[responder] drafted {len(reply)} chars, "
+            f"[responder] ({llm.last_model('responder')}) drafted {len(reply)} chars, "
             f"cited={result.get('cited_sources', [])}, refused={refused}"
         ],
     }

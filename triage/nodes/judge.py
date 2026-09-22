@@ -33,12 +33,18 @@ def judge(state: TicketState) -> TicketState:
             "escalation_reason": reason,
             "judge_checks": checks,
             "retry_count": state.get("retry_count", 0) + 1,
-            "trace": [f"[judge] RETRY (attempt {state.get('retry_count', 0) + 1}) -- {reason}"],
+            "trace": [
+                f"[judge] ({llm.last_model('judge')}) RETRY "
+                f"(attempt {state.get('retry_count', 0) + 1}) -- {reason}"
+            ],
         }
 
     return {
         "verdict": verdict,
         "escalation_reason": reason if verdict == "ESCALATE" else "",
         "judge_checks": checks,
-        "trace": [f"[judge] {verdict} -- checks={checks} -- {reason}"],
+        "trace": [
+            f"[judge] ({llm.last_model('judge')}) {verdict} "
+            f"-- checks={checks} -- {reason}"
+        ],
     }

@@ -22,7 +22,7 @@ def classify(state: TicketState) -> TicketState:
         "auto_answerable": auto_answerable,
         "classifier_reasoning": result.get("reasoning", ""),
         "trace": [
-            f"[classifier] category={category} auto_answerable={auto_answerable} "
-            f"-- {result.get('reasoning', '')}"
+            f"[classifier] ({llm.last_model('classifier')}) category={category} "
+            f"auto_answerable={auto_answerable} -- {result.get('reasoning', '')}"
         ],
     }
