@@ -4,9 +4,10 @@ A LangGraph pipeline that takes a raw customer support ticket and routes it
 through four specialized nodes, producing either an auto-drafted reply grounded
 in a real knowledge base, or a clean escalation with a stated reason.
 
-Claude via the Anthropic API for the reasoning nodes, a persistent local
-Chroma vector store, and local ONNX embeddings (so retrieval costs nothing and
-runs offline).
+Gemini for the reasoning nodes, a persistent local Chroma vector store, and
+local ONNX embeddings. Runs on Gemini's free tier, so the whole project costs
+nothing: retrieval is local, and the three model calls per ticket are free-tier
+requests.
 
 ```
 ticket -> Classifier -> [abusive/out-of-scope?] ------------> ESCALATE
@@ -30,7 +31,7 @@ brew install uv
 uv venv --python 3.12
 uv pip install -r requirements.txt
 
-export ANTHROPIC_API_KEY=sk-ant-...
+export GEMINI_API_KEY=...        # free, no card: aistudio.google.com/apikey
 .venv/bin/python -m triage.index        # build the Chroma collection
 ```
 
@@ -47,7 +48,7 @@ export ANTHROPIC_API_KEY=sk-ant-...
 | Path | What it is |
 |---|---|
 | `triage/state.py` | `TicketState`, the contract every node reads and writes |
-| `triage/llm.py` | One call signature, per-role models, `anthropic` / `stub` |
+| `triage/llm.py` | One call signature, per-role models, `gemini` / `stub` |
 | `triage/prompts.py` | Per-node system prompts and output schemas, in one place |
 | `triage/nodes/` | The four nodes |
 | `triage/graph.py` | Wiring and conditional edges |
@@ -61,11 +62,11 @@ export ANTHROPIC_API_KEY=sk-ant-...
 Every model call goes through `triage/llm.py` and names the role making it.
 Each role is bound to its own model:
 
-| Role | Model | Why |
-|---|---|---|
-| Classifier | `claude-haiku-4-5` | Picks one of four fixed labels. No reasoning needed. |
-| Responder | `claude-sonnet-5` | Rewrites retrieved text; thinking disabled. |
-| Judge | `claude-sonnet-5` | Weighs four competing conditions; adaptive thinking on. |
+| Role | Model | Thinking | Why |
+|---|---|---|---|
+| Classifier | `gemini-3.5-flash-lite` | `MINIMAL` | Picks one of four fixed labels. |
+| Responder | `gemini-3.8-flash` | `LOW` | Rewrites retrieved text. |
+| Judge | `gemini-3.8-flash` | `HIGH` | Weighs four competing conditions; its mistakes reach the customer. |
 
 Routing the mechanical call to the cheap model and reserving the expensive one
 for the node whose mistakes are costly is a deliberate choice, and it makes the
@@ -73,11 +74,21 @@ per-role model a variable the eval suite can sweep:
 
 ```bash
 # benchmark the judge on a stronger model, same fixtures
-TRIAGE_MODEL_JUDGE=claude-opus-5 .venv/bin/python -m pytest evals/ -v
+TRIAGE_MODEL_JUDGE=gemini-2.5-pro .venv/bin/python -m pytest evals/ -v
 
-# no model at all, deterministic, free
+# no model at all, deterministic, no network
 TRIAGE_LLM=stub .venv/bin/python -m pytest tests/ -q
 ```
+
+Structured output is enforced by the API via `response_schema`, which
+constrains decoding. Malformed JSON is therefore not a failure mode the prompts
+have to defend against.
+
+One trap worth knowing: **thinking tokens draw from the same budget as the
+visible answer.** A `max_output_tokens` sized only for the reply returns *empty
+text* rather than an error when the model thinks. `MAX_OUTPUT_TOKENS` in
+`triage/llm.py` is sized for thinking plus answer, and an empty response raises
+with the finish reason attached.
 
 This is what makes "does this fixture fail because my prompt is wrong, or
 because the model is too weak" an answerable question rather than a guess.

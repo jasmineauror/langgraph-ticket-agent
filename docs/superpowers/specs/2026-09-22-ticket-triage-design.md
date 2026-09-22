@@ -30,17 +30,18 @@ Non-goals: no UI, no hosted infra, no scraped data, no deployment.
 | Graph | `langgraph`, `langchain-core` | The thing being practiced |
 | Vector DB | `chromadb`, persistent at `./chroma_db` | Real collections, metadata filters, distance scores |
 | Embeddings | `sentence-transformers`, `all-MiniLM-L6-v2` | Offline, free, adequate for a ~15-doc KB |
-| LLM | Claude API, per-role models | Haiku 4.5 classifies, Sonnet 5 responds and judges; reliable structured output and strong refusal behavior |
+| LLM | Gemini API, per-role models | `gemini-3.5-flash-lite` classifies, `gemini-3.8-flash` responds and judges; schema-constrained output, and a real free tier |
 | Eval harness | `pytest` | Fixture-per-test, familiar output |
 
-**Cost: well under $1 for the whole build** (~$0.05 per 6-fixture eval run).
-Embeddings and the vector store are local and free; only the three reasoning
-calls per ticket are billed.
+**Total cost: $0.** Every model used here is available on Gemini's free tier,
+and embeddings plus the vector store run locally. Free-tier rate limits (not
+dollars) are the only constraint on how fast the eval loop can iterate.
 
-**Revised 2026-09-22:** originally specified a local Ollama model for $0. Changed
-to the API after the 9GB model pull proved to be the dominant cost in wall-clock
-time rather than dollars, and because reliable refusal behavior is the single
-property this project is built to demonstrate.
+**Revision history.** Originally specified a local Ollama model for $0; a 9GB
+model pull proved to dominate wall-clock time, so it was dropped. Then briefly
+specified the Claude API (~$1 total, $5 minimum credit). Settled on Gemini,
+which keeps the $0 cost without the download and without a paid minimum, and
+adds schema-constrained decoding that removes malformed JSON as a failure mode.
 
 ### LLM adapter
 
@@ -203,7 +204,8 @@ docs/
 
 | Risk | Mitigation |
 |---|---|
-| Model emits malformed JSON | Schema is injected into the system prompt; the adapter recovers JSON from prose and retries once |
+| Model emits malformed JSON | `response_schema` constrains decoding at the API level; the adapter still recovers from a code fence and retries once |
 | A fixture fails from model capability, not prompt quality | Raise that role's model via `TRIAGE_MODEL_<ROLE>`; the comparison is itself a deliverable |
-| API spend runs away during iteration | Per-role `max_tokens` ceilings; thinking enabled only on the judge; ~$0.05 per full eval run |
+| Thinking tokens silently truncate the answer | Thinking draws from `max_output_tokens`; ceilings are sized for thinking plus answer, and an empty response raises with the finish reason |
+| Free-tier rate limit throttles the eval loop | Six fixtures per run is well inside per-minute limits; the adapter retries once |
 | Judge retry loop spins | `retry_count` hard-capped at 1 |

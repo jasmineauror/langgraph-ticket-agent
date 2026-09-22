@@ -2,19 +2,22 @@
 
 Two backends, selected by the TRIAGE_LLM env var:
 
-    anthropic  (default) Claude via API
-    stub       deterministic canned responses, for unit tests
+    gemini  (default) Gemini via the Google AI API
+    stub    deterministic canned responses, for unit tests
 
-Every call names the *role* making it, and each role is bound to a specific
-model. Routing a mechanical classification to Haiku and reserving Sonnet for
-the two calls that need judgment is a deliberate cost choice, not an oversight:
-the classifier decides among four fixed labels, while the judge is the node
-whose mistakes are expensive.
+Every call names the *role* making it, and each role is bound to its own model
+and thinking level. The classifier chooses among four fixed labels, so it gets
+the cheapest model at minimal thinking. The judge weighs four competing
+conditions and its mistakes are the ones that reach a customer, so it gets the
+strongest model at high thinking.
 
 Because the role is a parameter, the same eval suite can be rerun with a
-different model per role -- which is what makes "does this fixture fail because
-my prompt is wrong, or because the model is too weak" an answerable question
-instead of a guess.
+different model in one role -- which turns "does this fixture fail because my
+prompt is wrong, or because the model is too weak" into an answerable question.
+
+Structured output is enforced by the API: passing `response_schema` constrains
+decoding, so malformed JSON is not a failure mode we have to defend against in
+prompt text.
 """
 
 from __future__ import annotations
@@ -26,23 +29,23 @@ from typing import Any
 # Per-role model assignment. Override any of these from the environment to
 # benchmark a role on a different model without touching the graph.
 MODELS = {
-    "classifier": os.environ.get("TRIAGE_MODEL_CLASSIFIER", "claude-haiku-4-5"),
-    "responder": os.environ.get("TRIAGE_MODEL_RESPONDER", "claude-sonnet-5"),
-    "judge": os.environ.get("TRIAGE_MODEL_JUDGE", "claude-sonnet-5"),
+    "classifier": os.environ.get("TRIAGE_MODEL_CLASSIFIER", "gemini-3.5-flash-lite"),
+    "responder": os.environ.get("TRIAGE_MODEL_RESPONDER", "gemini-3.8-flash"),
+    "judge": os.environ.get("TRIAGE_MODEL_JUDGE", "gemini-3.8-flash"),
 }
 
-# Output ceilings sized to each role's job. Kept modest to bound cost, but
-# generous enough that a reply is never truncated mid-sentence.
-MAX_TOKENS = {"classifier": 512, "responder": 1536, "judge": 768}
-
-# Thinking is enabled only where reasoning actually changes the answer. The
-# classifier picks one of four labels and the responder rewrites retrieved text;
-# the judge weighs four competing conditions, so it gets adaptive thinking.
-THINKING = {
-    "classifier": None,  # Haiku 4.5 without a budget: no thinking
-    "responder": {"type": "disabled"},
-    "judge": "adaptive",  # omit the param -> Sonnet 5 runs adaptive
+# Thinking effort per role, matched to how much the decision benefits from it.
+THINKING_LEVEL = {
+    "classifier": "MINIMAL",
+    "responder": "LOW",
+    "judge": "HIGH",
 }
+
+# Thinking tokens are drawn from the same budget as the visible response. A
+# ceiling sized only for the answer therefore returns EMPTY text rather than an
+# error when the model thinks: the budget is spent before it writes anything.
+# These are sized for thinking level plus answer, not answer alone.
+MAX_OUTPUT_TOKENS = {"classifier": 1024, "responder": 4096, "judge": 8192}
 
 
 class LLMError(RuntimeError):
@@ -70,7 +73,7 @@ def _call_stub(role: str, system: str, user: str, schema: dict | None) -> Any:
     raise LLMError(f"stub has no response registered for prompt: {user[:80]!r}")
 
 
-# --- anthropic backend ------------------------------------------------------
+# --- gemini backend ---------------------------------------------------------
 
 _client = None
 
@@ -78,41 +81,56 @@ _client = None
 def _get_client():
     global _client
     if _client is None:
-        import anthropic
+        from google import genai
 
-        _client = anthropic.Anthropic()
+        if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
+            raise LLMError(
+                "no API key found: set GEMINI_API_KEY (free key from "
+                "https://aistudio.google.com/apikey)"
+            )
+        _client = genai.Client()
     return _client
 
 
-def _call_anthropic(role: str, system: str, user: str, schema: dict | None) -> Any:
-    if schema is not None:
-        system = (
-            f"{system}\n\nRespond with a single JSON object matching this schema, "
-            f"and nothing else -- no prose, no code fence:\n{json.dumps(schema)}"
-        )
+def _call_gemini(role: str, system: str, user: str, schema: dict | None) -> Any:
+    from google.genai import types
 
-    kwargs: dict[str, Any] = {
-        "model": MODELS[role],
-        "max_tokens": MAX_TOKENS[role],
-        "system": system,
-        "messages": [{"role": "user", "content": user}],
+    config_kwargs: dict[str, Any] = {
+        "system_instruction": system,
+        "max_output_tokens": MAX_OUTPUT_TOKENS[role],
+        "thinking_config": types.ThinkingConfig(
+            thinking_level=THINKING_LEVEL[role]
+        ),
     }
 
-    thinking = THINKING[role]
-    if isinstance(thinking, dict):
-        kwargs["thinking"] = thinking
-    # `None` and "adaptive" both mean "send no thinking param"; the difference is
-    # the model's own default, which the table in THINKING documents.
+    if schema is not None:
+        # Constrains decoding to the schema, so the shape is guaranteed rather
+        # than requested.
+        config_kwargs["response_mime_type"] = "application/json"
+        config_kwargs["response_schema"] = schema
 
-    response = _get_client().messages.create(**kwargs)
-
-    if response.stop_reason == "refusal":
-        raise LLMError(f"model declined the request in role {role!r}")
-
-    content = "".join(
-        block.text for block in response.content if block.type == "text"
+    response = _get_client().models.generate_content(
+        model=MODELS[role],
+        contents=user,
+        config=types.GenerateContentConfig(**config_kwargs),
     )
-    return _parse(content, schema)
+
+    text = response.text
+    if not text:
+        raise LLMError(
+            f"empty response in role {role!r} "
+            f"(finish_reason={_finish_reason(response)!r}); "
+            f"if MAX_TOKENS, raise MAX_OUTPUT_TOKENS[{role!r}]"
+        )
+
+    return _parse(text, schema)
+
+
+def _finish_reason(response) -> str | None:
+    try:
+        return str(response.candidates[0].finish_reason)
+    except (AttributeError, IndexError, TypeError):
+        return None
 
 
 # --- shared -----------------------------------------------------------------
@@ -124,7 +142,8 @@ def _parse(content: str, schema: dict | None) -> Any:
     try:
         return json.loads(content)
     except json.JSONDecodeError:
-        # Recover a JSON object wrapped in prose or a code fence.
+        # Should not happen with response_schema set, but a code fence or
+        # trailing prose is cheap to recover from.
         start, end = content.find("{"), content.rfind("}")
         if start != -1 and end > start:
             try:
@@ -135,13 +154,13 @@ def _parse(content: str, schema: dict | None) -> Any:
 
 
 _BACKENDS = {
-    "anthropic": _call_anthropic,
+    "gemini": _call_gemini,
     "stub": _call_stub,
 }
 
 
 def backend_name() -> str:
-    return os.environ.get("TRIAGE_LLM", "anthropic").lower()
+    return os.environ.get("TRIAGE_LLM", "gemini").lower()
 
 
 def model_name(role: str | None = None) -> str:
@@ -150,15 +169,14 @@ def model_name(role: str | None = None) -> str:
         return "stub"
     if role:
         return MODELS[role]
-    distinct = sorted(set(MODELS.values()))
-    return " + ".join(distinct)
+    return " + ".join(sorted(set(MODELS.values())))
 
 
 def call(role: str, system: str, user: str, schema: dict | None = None) -> Any:
     """Run one model call on behalf of `role`.
 
     With `schema`, returns a parsed dict. Without, returns stripped text.
-    Retries once on unparseable output before giving up.
+    Retries once on a transient failure before giving up.
     """
     if role not in MODELS:
         raise LLMError(f"unknown role {role!r}; expected one of {sorted(MODELS)}")
