@@ -30,23 +30,35 @@ Non-goals: no UI, no hosted infra, no scraped data, no deployment.
 | Graph | `langgraph`, `langchain-core` | The thing being practiced |
 | Vector DB | `chromadb`, persistent at `./chroma_db` | Real collections, metadata filters, distance scores |
 | Embeddings | `sentence-transformers`, `all-MiniLM-L6-v2` | Offline, free, adequate for a ~15-doc KB |
-| LLM | Ollama, `qwen2.5:14b` class local model | $0; 24GB RAM runs a 14B comfortably; frozen weights make evals reproducible |
+| LLM | Claude API, per-role models | Haiku 4.5 classifies, Sonnet 5 responds and judges; reliable structured output and strong refusal behavior |
 | Eval harness | `pytest` | Fixture-per-test, familiar output |
 
-**Total cost: $0.** No accounts, no keys, runs offline after setup.
+**Cost: well under $1 for the whole build** (~$0.05 per 6-fixture eval run).
+Embeddings and the vector store are local and free; only the three reasoning
+calls per ticket are billed.
+
+**Revised 2026-09-22:** originally specified a local Ollama model for $0. Changed
+to the API after the 9GB model pull proved to be the dominant cost in wall-clock
+time rather than dollars, and because reliable refusal behavior is the single
+property this project is built to demonstrate.
 
 ### LLM adapter
 
-All model calls go through one `call()` signature in `triage/llm.py`, backed by either
-Ollama or the Anthropic API selected by a `TRIAGE_LLM` env var. Rationale:
+All model calls go through one `call(role, ...)` signature in `triage/llm.py`.
+Each role is bound to its own model, overridable per role from the environment.
+Rationale:
 
 - If a fixture fails for reasons unrelated to prompt quality, the adapter isolates
   "my prompt is wrong" from "this model is too small" — otherwise the eval signal is
   ambiguous and the iteration loop teaches nothing.
-- Running the same eval suite against two models is a stronger benchmarking story
-  than either model alone.
+- Running the same eval suite with a different model in one role is a real
+  benchmark, and the cheapest way to tell a prompt problem from a capability
+  problem.
+- Binding the classifier to Haiku and the judge to Sonnet is itself a cost
+  decision worth defending: the cheap model handles the four-label choice, the
+  expensive one handles the call whose errors reach a customer.
 
-Cost of the abstraction is ~20 lines. Default is Ollama.
+Cost of the abstraction is ~30 lines.
 
 ## Architecture
 
@@ -191,7 +203,7 @@ docs/
 
 | Risk | Mitigation |
 |---|---|
-| Local model emits malformed JSON | Ollama constrains decoding to a JSON schema; adapter validates and retries once |
-| A fixture fails from model capability, not prompt quality | Swap `TRIAGE_LLM=anthropic` to isolate; that comparison is itself a deliverable |
-| 9GB model pull blocks work | Pulled in the background while the KB and nodes are written |
+| Model emits malformed JSON | Schema is injected into the system prompt; the adapter recovers JSON from prose and retries once |
+| A fixture fails from model capability, not prompt quality | Raise that role's model via `TRIAGE_MODEL_<ROLE>`; the comparison is itself a deliverable |
+| API spend runs away during iteration | Per-role `max_tokens` ceilings; thinking enabled only on the judge; ~$0.05 per full eval run |
 | Judge retry loop spins | `retry_count` hard-capped at 1 |

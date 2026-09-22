@@ -8,6 +8,7 @@ from ..state import TicketState
 
 def classify(state: TicketState) -> TicketState:
     result = llm.call(
+        role="classifier",
         system=prompts.CLASSIFIER_SYSTEM,
         user=f"Ticket:\n\n{state['ticket_text']}",
         schema=prompts.CLASSIFIER_SCHEMA,

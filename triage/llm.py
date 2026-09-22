@@ -1,16 +1,20 @@
 """Single entry point for every model call in the graph.
 
-Backend is chosen by the TRIAGE_LLM env var:
+Two backends, selected by the TRIAGE_LLM env var:
 
-    ollama     (default) local model, free, offline, frozen weights
-    anthropic  Claude via API, for isolating "small model" failures from
-               "bad prompt" failures when an eval fixture fails
+    anthropic  (default) Claude via API
     stub       deterministic canned responses, for unit tests
 
-Keeping every call behind one signature is what makes the model a variable in
-the eval suite rather than a hardcoded assumption. When a fixture fails, being
-able to rerun the identical suite on a stronger model tells you whether the
-prompt is wrong or the model is too small -- otherwise that signal is ambiguous.
+Every call names the *role* making it, and each role is bound to a specific
+model. Routing a mechanical classification to Haiku and reserving Sonnet for
+the two calls that need judgment is a deliberate cost choice, not an oversight:
+the classifier decides among four fixed labels, while the judge is the node
+whose mistakes are expensive.
+
+Because the role is a parameter, the same eval suite can be rerun with a
+different model per role -- which is what makes "does this fixture fail because
+my prompt is wrong, or because the model is too weak" an answerable question
+instead of a guess.
 """
 
 from __future__ import annotations
@@ -19,8 +23,26 @@ import json
 import os
 from typing import Any
 
-OLLAMA_MODEL = os.environ.get("TRIAGE_OLLAMA_MODEL", "qwen3:14b")
-ANTHROPIC_MODEL = os.environ.get("TRIAGE_ANTHROPIC_MODEL", "claude-sonnet-5")
+# Per-role model assignment. Override any of these from the environment to
+# benchmark a role on a different model without touching the graph.
+MODELS = {
+    "classifier": os.environ.get("TRIAGE_MODEL_CLASSIFIER", "claude-haiku-4-5"),
+    "responder": os.environ.get("TRIAGE_MODEL_RESPONDER", "claude-sonnet-5"),
+    "judge": os.environ.get("TRIAGE_MODEL_JUDGE", "claude-sonnet-5"),
+}
+
+# Output ceilings sized to each role's job. Kept modest to bound cost, but
+# generous enough that a reply is never truncated mid-sentence.
+MAX_TOKENS = {"classifier": 512, "responder": 1536, "judge": 768}
+
+# Thinking is enabled only where reasoning actually changes the answer. The
+# classifier picks one of four labels and the responder rewrites retrieved text;
+# the judge weighs four competing conditions, so it gets adaptive thinking.
+THINKING = {
+    "classifier": None,  # Haiku 4.5 without a budget: no thinking
+    "responder": {"type": "disabled"},
+    "judge": "adaptive",  # omit the param -> Sonnet 5 runs adaptive
+}
 
 
 class LLMError(RuntimeError):
@@ -41,60 +63,55 @@ def clear_stub() -> None:
     _STUB_RESPONSES.clear()
 
 
-def _call_stub(system: str, user: str, schema: dict | None) -> Any:
+def _call_stub(role: str, system: str, user: str, schema: dict | None) -> Any:
     for key, value in _STUB_RESPONSES.items():
         if key in system or key in user:
             return value
     raise LLMError(f"stub has no response registered for prompt: {user[:80]!r}")
 
 
-# --- ollama backend ---------------------------------------------------------
-
-
-def _call_ollama(system: str, user: str, schema: dict | None) -> Any:
-    import ollama
-
-    kwargs: dict[str, Any] = {
-        "model": OLLAMA_MODEL,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        # qwen3 emits <think> blocks by default, which corrupt structured output
-        # and waste tokens on decisions this simple.
-        "think": False,
-        "options": {"temperature": 0.0},
-    }
-    if schema is not None:
-        # Ollama constrains decoding to the schema, so the shape is reliable
-        # even on a small model. Label *correctness* is still the model's job.
-        kwargs["format"] = schema
-
-    response = ollama.chat(**kwargs)
-    content = response["message"]["content"]
-    return _parse(content, schema)
-
-
 # --- anthropic backend ------------------------------------------------------
 
+_client = None
 
-def _call_anthropic(system: str, user: str, schema: dict | None) -> Any:
-    import anthropic
 
-    client = anthropic.Anthropic()
+def _get_client():
+    global _client
+    if _client is None:
+        import anthropic
+
+        _client = anthropic.Anthropic()
+    return _client
+
+
+def _call_anthropic(role: str, system: str, user: str, schema: dict | None) -> Any:
     if schema is not None:
         system = (
             f"{system}\n\nRespond with a single JSON object matching this schema, "
-            f"and nothing else:\n{json.dumps(schema)}"
+            f"and nothing else -- no prose, no code fence:\n{json.dumps(schema)}"
         )
 
-    response = client.messages.create(
-        model=ANTHROPIC_MODEL,
-        max_tokens=1024,
-        system=system,
-        messages=[{"role": "user", "content": user}],
+    kwargs: dict[str, Any] = {
+        "model": MODELS[role],
+        "max_tokens": MAX_TOKENS[role],
+        "system": system,
+        "messages": [{"role": "user", "content": user}],
+    }
+
+    thinking = THINKING[role]
+    if isinstance(thinking, dict):
+        kwargs["thinking"] = thinking
+    # `None` and "adaptive" both mean "send no thinking param"; the difference is
+    # the model's own default, which the table in THINKING documents.
+
+    response = _get_client().messages.create(**kwargs)
+
+    if response.stop_reason == "refusal":
+        raise LLMError(f"model declined the request in role {role!r}")
+
+    content = "".join(
+        block.text for block in response.content if block.type == "text"
     )
-    content = "".join(b.text for b in response.content if b.type == "text")
     return _parse(content, schema)
 
 
@@ -107,8 +124,7 @@ def _parse(content: str, schema: dict | None) -> Any:
     try:
         return json.loads(content)
     except json.JSONDecodeError:
-        # Recover a JSON object embedded in prose, which is the usual failure
-        # mode when a backend does not hard-constrain decoding.
+        # Recover a JSON object wrapped in prose or a code fence.
         start, end = content.find("{"), content.rfind("}")
         if start != -1 and end > start:
             try:
@@ -119,41 +135,44 @@ def _parse(content: str, schema: dict | None) -> Any:
 
 
 _BACKENDS = {
-    "ollama": _call_ollama,
     "anthropic": _call_anthropic,
     "stub": _call_stub,
 }
 
 
 def backend_name() -> str:
-    return os.environ.get("TRIAGE_LLM", "ollama").lower()
+    return os.environ.get("TRIAGE_LLM", "anthropic").lower()
 
 
-def model_name() -> str:
-    """The specific model in play, for the eval log."""
-    name = backend_name()
-    return {
-        "ollama": OLLAMA_MODEL,
-        "anthropic": ANTHROPIC_MODEL,
-        "stub": "stub",
-    }.get(name, name)
+def model_name(role: str | None = None) -> str:
+    """The model in play, for the eval log and the CLI header."""
+    if backend_name() == "stub":
+        return "stub"
+    if role:
+        return MODELS[role]
+    distinct = sorted(set(MODELS.values()))
+    return " + ".join(distinct)
 
 
-def call(system: str, user: str, schema: dict | None = None) -> Any:
-    """Run one model call.
+def call(role: str, system: str, user: str, schema: dict | None = None) -> Any:
+    """Run one model call on behalf of `role`.
 
     With `schema`, returns a parsed dict. Without, returns stripped text.
     Retries once on unparseable output before giving up.
     """
+    if role not in MODELS:
+        raise LLMError(f"unknown role {role!r}; expected one of {sorted(MODELS)}")
+
     name = backend_name()
     if name not in _BACKENDS:
-        raise LLMError(f"unknown TRIAGE_LLM backend {name!r}; expected one of {sorted(_BACKENDS)}")
+        raise LLMError(
+            f"unknown TRIAGE_LLM backend {name!r}; expected one of {sorted(_BACKENDS)}"
+        )
     fn = _BACKENDS[name]
 
     try:
-        return fn(system, user, schema)
+        return fn(role, system, user, schema)
     except LLMError:
         if name == "stub":
             raise
-        # One retry. Malformed JSON from a small model is usually transient.
-        return fn(system, user, schema)
+        return fn(role, system, user, schema)

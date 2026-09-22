@@ -15,6 +15,7 @@ def judge(state: TicketState) -> TicketState:
     )
 
     result = llm.call(
+        role="judge",
         system=prompts.JUDGE_SYSTEM,
         user=user,
         schema=prompts.JUDGE_SCHEMA,

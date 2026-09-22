@@ -23,6 +23,7 @@ def respond(state: TicketState) -> TicketState:
     )
 
     result = llm.call(
+        role="responder",
         system=prompts.RESPONDER_SYSTEM,
         user=user,
         schema=prompts.RESPONDER_SCHEMA,
