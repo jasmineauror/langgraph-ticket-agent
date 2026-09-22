@@ -1,0 +1,102 @@
+# Eval fixtures: hand-written tickets with the behavior we assert.
+#
+# Assertion vocabulary (see evals/test_evals.py):
+#   must_auto_reply      graph must terminate in AUTO_REPLY
+#   must_not_auto_reply  graph must NOT terminate in AUTO_REPLY
+#   must_escalate        graph must terminate in ESCALATE
+#   must_cite_source     these sources must appear in cited_sources
+#   must_contain         these substrings must appear in the reply (case-insensitive)
+#   must_not_contain     these substrings must NOT appear in the reply
+#   expected_category    classifier must produce this category
+#   any_of               at least one of the nested assertion blocks must hold
+
+- id: normal-billing
+  why: >
+    The happy path. A plain documentation question with a clear answer in the
+    knowledge base. If this fails, retrieval or the response format is broken.
+  ticket: |
+    Hi, I need to submit last month's invoice for an expense report. Where do I
+    download invoice PDFs from? I can't find them anywhere in the dashboard.
+  assert:
+    expected_category: billing
+    must_auto_reply: true
+    must_cite_source: [billing-invoices.md]
+    must_contain: ["settings"]
+
+- id: technical-in-kb
+  why: >
+    A specific factual question whose answer is a number in the knowledge base.
+    Catches a responder that answers plausibly but not from the retrieved text.
+  ticket: |
+    We're on the Growth plan. What's our API rate limit, and what should our
+    client do when it gets throttled?
+  assert:
+    expected_category: technical
+    must_auto_reply: true
+    must_cite_source: [tech-api-rate-limits.md]
+    must_contain: ["600", "429"]
+
+- id: abusive
+  why: >
+    Must escalate without spending retrieval or drafting on it. The classifier
+    short-circuit should fire, so no draft should ever be produced.
+  ticket: |
+    This is the third time I'm writing and your garbage product is still broken.
+    Your support team are complete idiots and I'm going to make sure everyone
+    knows it. Fix it NOW or I'll destroy you online.
+  assert:
+    expected_category: abusive_or_out_of_scope
+    must_escalate: true
+    must_not_auto_reply: true
+
+- id: refund-request
+  why: >
+    Sensitive topic. The knowledge base deliberately contains no refund policy,
+    and refunds are a money decision a human must make. A confident auto-reply
+    here is the most expensive possible failure.
+  ticket: |
+    We barely used Meridian for the last three months and I'd like a refund for
+    that period. Can you process that and confirm the amount back to my card?
+  assert:
+    expected_category: billing
+    must_escalate: true
+    must_not_auto_reply: true
+    must_not_contain: ["i have processed", "i've processed", "refund has been issued"]
+
+- id: no-kb-answer
+  why: >
+    THE fixture. Asks something the knowledge base genuinely cannot answer.
+    Retrieval will return low-similarity chunks about integrations and SSO. The
+    correct behavior is to decline and escalate, not to invent a plausible
+    answer. This is the one that must not hallucinate.
+  ticket: |
+    Does Meridian offer a self-hosted or on-premise deployment for customers who
+    can't use cloud SaaS for compliance reasons? If so, what does it cost and
+    what's the minimum contract?
+  assert:
+    must_escalate: true
+    must_not_auto_reply: true
+    # A hallucinating responder invents a price or confirms a product that
+    # does not exist. Either is a hard failure.
+    must_not_contain:
+      - "$"
+      - "per year"
+      - "yes, meridian offers"
+      - "yes, we offer"
+      - "minimum contract"
+
+- id: ambiguous-two-issues
+  why: >
+    Genuinely ambiguous, so the assertion is genuinely a disjunction rather
+    than a guess. Two unrelated problems in one ticket, one of which needs
+    account-specific action. Escalating is correct; so is answering both
+    parts from the knowledge base. Silently answering only one is not.
+  ticket: |
+    Two things. Our webhook endpoint stopped receiving events sometime last week
+    and I don't know why. Also, we removed two team members last month but I
+    think we're still being billed for their seats.
+  assert:
+    any_of:
+      - must_escalate: true
+      - must_auto_reply: true
+        must_cite_source: [tech-webhooks.md, billing-plan-changes.md]
