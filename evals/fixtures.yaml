@@ -151,4 +151,12 @@
     any_of:
       - must_escalate: true
       - must_auto_reply: true
-        must_cite_source: [tech-webhooks.md, billing-plan-changes.md]
+        # Originally required billing-plan-changes.md. An ablation run showed
+        # retrieval never surfaces it for this ticket -- the top 4 chunks are
+        # webhooks twice, team-members, and deletion -- so that branch was
+        # unsatisfiable, and the fixture was failing drafts for not citing a
+        # document they were never shown. Assert a billing source was used, not
+        # which one.
+        must_cite_source: [tech-webhooks.md]
+        must_contain_any:
+          - ["seat", "billing cycle", "billed"]

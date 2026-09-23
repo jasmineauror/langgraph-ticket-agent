@@ -10,9 +10,11 @@ seat count, an invitation reserves a seat as soon as it is sent, not when accept
 manages members and integrations but not billing. Member creates and edits
 dashboards. Viewer has read-only access. Billing Admin sees only billing.
 
-**Removing.** Removing a member frees their seat immediately. Dashboards they created
-stay in the workspace and transfer ownership to the Owner who removed them, so
-nothing is lost.
+**Removing.** Removing a member revokes their access immediately, but the seat
+itself is not credited until the next billing cycle -- see the plan and
+proration documentation for how seat changes are billed. Dashboards they
+created stay in the workspace and transfer ownership to the Owner who removed
+them, so nothing is lost.
 
 A workspace must always have at least one Owner; the last Owner cannot be removed or
 downgraded until another Owner is assigned.

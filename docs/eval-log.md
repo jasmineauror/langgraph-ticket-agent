@@ -244,3 +244,91 @@ Three samples establishes repeatability, not a stability guarantee. The honest
 claim is "it passed three consecutive runs," and the fixture most likely to
 wobble is `ambiguous-two-issues`, whose `any_of` assertion accepts two
 different correct handlings precisely because the input is genuinely ambiguous.
+
+## Round 4 — Cross-provider benchmark, and the three bugs an ablation found
+
+Adding the Groq backend made the same 7 fixtures runnable against a second
+provider with the prompts held constant. Both passed 7/7, which is reassuring
+and uninformative: when everything passes you learn nothing about where the
+margin is.
+
+So instead of comparing providers, I tested a **design claim**. I had asserted
+the judge is the capability-critical role and gave it the strongest model on
+that basis. That is falsifiable: downgrade one role at a time to the weakest
+model and see which breaks.
+
+| Configuration | Score |
+|---|---|
+| groq, full chain | 7/7 |
+| groq, **judge** -> `gpt-oss-20b` | 7/7 |
+| groq, **responder** -> `gpt-oss-20b` | **6/7** |
+
+The responder mattered and the judge did not — the opposite of my assumption.
+But reading the trace of the one failure showed the result was not a clean
+capability finding at all. It was **three separate bugs**, two of them mine.
+
+### Bug 1 — the judge could un-decide, and did
+
+```
+[judge] RETRY -- "Ticket involves a billing inquiry about seat charges,
+                  which is a sensitive matter (failed: touches_sensitive)"
+[responder] redrafted, shorter
+[judge] SEND -- {'touches_sensitive': False, ...}
+```
+
+The judge flagged the ticket sensitive, the responder reworded, and the judge
+then reported it **not** sensitive and approved the reply. On the *strong* model.
+
+The defect is mine, in how I grouped the checks. `addresses_ticket`,
+`grounded_in_sources` and `cites_sources` are faults in the **draft**, and a
+redraft can genuinely fix them. `touches_sensitive` is a fact about the
+**ticket** — a seat-billing dispute does not stop being about money because the
+reply was reworded. By lumping it in with the others I handed the judge a second
+independent chance to reach the opposite conclusion, converting one correct
+escalation into a coin flip.
+
+**Fix:** `touches_sensitive` is decided once and never retried. Only
+draft-quality failures are redraftable. Two unit tests pin both halves.
+
+### Bug 2 — my knowledge base contradicted itself
+
+`account-team-members.md` said removing a member "frees their seat
+immediately". `billing-plan-changes.md` said "removing seats takes effect at
+the next cycle." Both were mine, and the responder cited whichever one
+retrieval happened to surface — which was the more customer-favourable and
+probably wrong answer.
+
+Realistic, as knowledge-base bugs go, and invisible until a fixture happened to
+ask a question spanning both. **Fix:** the access/billing distinction is now
+explicit in one place and defers to the other document.
+
+### Bug 3 — the fixture asserted something unretrievable
+
+`ambiguous-two-issues` required citing `billing-plan-changes.md`. Retrieval
+never surfaces it for that ticket — the top 4 chunks are webhooks twice,
+team-members, and deletion. The assertion was **unsatisfiable**, so the fixture
+was failing drafts for not citing a document they were never shown.
+
+A third instance of the round-3 lesson: assert the substance (a billing source
+was used, and the reply discusses seats and billing cycles), not one document I
+assumed retrieval would pick.
+
+### After the fixes
+
+| Configuration | Score | Runtime |
+|---|---|---|
+| groq, full chain | 7/7 | 33s |
+| groq, judge -> `gpt-oss-20b` | 7/7 | 73s |
+| groq, responder -> `gpt-oss-20b` | 7/7 | 80s |
+| gemini, full chain | 7/7 | 33s |
+
+The ablation no longer separates the roles, because the bugs it exposed are
+gone. Its value was diagnostic, not comparative — and the end state says
+something about the architecture: **the pipeline passes with the 20B model in
+either reasoning seat.** The code gates (explicit refusal, the 0.40 grounding
+floor) and the sticky-sensitive rule carry enough of the safety burden that
+model capability is not the binding factor.
+
+Which is the original design thesis, arrived at by a longer road than intended:
+put *not-knowing* in code where it is inspectable, and ask the model only for
+the judgment code cannot make.

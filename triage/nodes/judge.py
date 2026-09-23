@@ -33,16 +33,31 @@ MAX_RETRIES = 1
 # placed in the narrow gap between answerable and unanswerable fixtures.
 GROUNDING_FLOOR = 0.40
 
-SENSITIVE_CHECKS = (
+# Failures a NEW DRAFT could plausibly fix. Only these are worth a retry.
+REDRAFTABLE_CHECKS = (
     "addresses_ticket",
     "grounded_in_sources",
     "cites_sources",
 )
 
 
-def _escalate(state: TicketState, reason: str, checks: dict) -> TicketState:
-    """Escalate, or spend one retry on the responder first."""
-    if state.get("retry_count", 0) < MAX_RETRIES:
+def _escalate(
+    state: TicketState, reason: str, checks: dict, redraftable: bool = True
+) -> TicketState:
+    """Escalate, or spend one retry on the responder first.
+
+    `redraftable=False` skips the retry entirely. Some failures are facts about
+    the TICKET rather than faults in the draft -- a seat-billing dispute does
+    not stop being about money because the reply was reworded -- and retrying
+    them is worse than useless: it hands the judge a second independent chance
+    to reach the opposite conclusion.
+
+    Measured, on the strong model: the judge flagged touches_sensitive, the
+    responder reworded, and the judge then reported touches_sensitive=False and
+    approved the reply. Retrying a ticket-level fact converts one correct
+    escalation into a coin flip.
+    """
+    if redraftable and state.get("retry_count", 0) < MAX_RETRIES:
         return {
             "verdict": "RETRY",
             "decided_by": "judge",
@@ -114,10 +129,16 @@ def judge(state: TicketState) -> TicketState:
     # The rubric is enforced here rather than trusted from the model's verdict.
     # A model that reports grounded_in_sources=False and then returns SEND has
     # contradicted itself, and the checks are the more reliable signal.
-    failed = [name for name in SENSITIVE_CHECKS if not checks[name]]
+    # Sensitive is decided once and never revisited.
     if checks["touches_sensitive"]:
-        failed.append("touches_sensitive")
+        return _escalate(
+            state,
+            f"{reason} (failed: touches_sensitive)",
+            checks,
+            redraftable=False,
+        )
 
+    failed = [name for name in REDRAFTABLE_CHECKS if not checks[name]]
     if failed:
         return _escalate(state, f"{reason} (failed: {', '.join(failed)})", checks)
 

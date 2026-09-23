@@ -184,3 +184,37 @@ def test_rubric_overrides_a_self_contradicting_verdict(fake_kb):
 
     assert state["verdict"] == "ESCALATE"
     assert "grounded_in_sources" in state["escalation_reason"]
+
+
+def test_sensitive_topic_never_gets_a_retry(fake_kb):
+    """A ticket-level fact must not be re-litigated by a redraft.
+
+    Measured on a strong model: the judge flagged touches_sensitive, the
+    responder reworded, and the judge then reported touches_sensitive=False and
+    approved the reply. Retrying a fact about the ticket converts one correct
+    escalation into a coin flip, so it escalates on the first flag.
+    """
+    fake_kb([("Seat changes bill next cycle.", "billing-plan-changes.md", 0.3)])
+    _classified("billing")
+    llm.set_stub(RESPONDER_KEY, {"reply": "Seats bill next cycle.",
+                                 "cited_sources": ["billing-plan-changes.md"]})
+    llm.set_stub(JUDGE_KEY, _judge(verdict="SEND", touches_sensitive=True))
+
+    state = build_graph().invoke(new_state("am I still billed for removed seats"))
+
+    assert state["verdict"] == "ESCALATE"
+    assert state["retry_count"] == 0, "a sensitive ticket must not be redrafted"
+    assert "touches_sensitive" in state["escalation_reason"]
+
+
+def test_draft_quality_failures_still_get_their_one_retry(fake_kb):
+    """The contrast: a bad draft IS worth redrafting, exactly once."""
+    fake_kb([("Some text.", "tech-webhooks.md", 0.3)])
+    _classified("technical")
+    llm.set_stub(RESPONDER_KEY, {"reply": "Vague.", "cited_sources": ["tech-webhooks.md"]})
+    llm.set_stub(JUDGE_KEY, _judge(verdict="ESCALATE", addresses_ticket=False))
+
+    state = build_graph().invoke(new_state("why did my webhook stop"))
+
+    assert state["verdict"] == "ESCALATE"
+    assert state["retry_count"] == 1, "draft faults get exactly one redraft"
