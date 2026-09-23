@@ -7,6 +7,10 @@ Three backends, selected by the TRIAGE_LLM env var:
             against Gemini's 20/day/model, which is the difference between ~66
             eval runs a day and ~4. Same schema guarantee: gpt-oss and qwen
             support strict constrained decoding.
+    demo    replays real responses recorded from a live run, keyed by prompt.
+            Exercises the whole graph -- routing, retrieval, both code gates,
+            the judge rubric -- with no network and no quota. Only the model's
+            wording is fixed.
     stub    deterministic canned responses, for unit tests
 
 Every call names the *role* making it, and each role is bound to its own model
@@ -26,10 +30,13 @@ prompt text.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import pathlib
 import random
+import threading
 import time
 from typing import Any
 
@@ -71,10 +78,34 @@ TRANSIENT_STATUS = CAPACITY_STATUS | QUOTA_STATUS
 # under a minute. Pacing every request through one global minimum interval keeps
 # the suite inside the limit instead of discovering it by being throttled.
 MIN_REQUEST_INTERVAL_SECONDS = float(os.environ.get("TRIAGE_MIN_INTERVAL", "1.5"))
+
+
+def _min_interval() -> float:
+    """The pacing interval, re-read per call.
+
+    The module constant above is evaluated at import, which means a caller that
+    sets TRIAGE_MIN_INTERVAL later -- a UI control, say -- would change nothing
+    and get no error. That matters because the quota error this module raises
+    tells the operator to raise TRIAGE_MIN_INTERVAL; an instruction the process
+    cannot obey is worse than no instruction. The constant stays as the default.
+    """
+    raw = os.environ.get("TRIAGE_MIN_INTERVAL")
+    if raw is None:
+        return MIN_REQUEST_INTERVAL_SECONDS
+    try:
+        return float(raw)
+    except ValueError:
+        return MIN_REQUEST_INTERVAL_SECONDS
+
+
 QUOTA_BACKOFF_SECONDS = 20.0
 # A model whose DAILY quota is gone will not recover within this session.
 DAILY_EXHAUSTED_COOLDOWN_SECONDS = 86_400.0
 _last_request_at = 0.0
+# Guards the read-sleep-write in _pace(). Without it two threads both see a
+# stale _last_request_at, both decide no wait is needed, and both fire -- the
+# limiter stops limiting exactly under the concurrency that causes 429s.
+_pace_lock = threading.Lock()
 
 # Retry budgets, sized against a lesson learned the expensive way. An earlier
 # version used 5 attempts per model across a 3-model chain with no global
@@ -113,6 +144,26 @@ def circuit_state() -> dict[str, float]:
     now = time.monotonic()
     return {m: round(t - now, 1) for m, t in _circuit.items() if t > now}
 
+
+def clear_circuit() -> list[str]:
+    """Forget every tripped model. Returns the models that were cleared.
+
+    A daily-quota trip sets an 86,400s cooldown, and one eval run is ~21
+    requests against a 20/model/day free tier -- so a single run can bench every
+    model in a role's chain for the life of the process, with no way back. In a
+    CLI that is fine; you restart. In a long-lived server it is an outage with no
+    remedy available to the person looking at it.
+
+    Deliberately manual. An automatic or timed clear would restore the retry
+    amplification that CIRCUIT_COOLDOWN_SECONDS exists to prevent. Clearing
+    re-probes models that may genuinely still be exhausted: that costs one
+    instant 429, or one slow 503, per model. Bounded and visible, which is
+    strictly better than unrecoverable.
+    """
+    cleared = sorted(_circuit)
+    _circuit.clear()
+    return cleared
+
 # Per-role model preference, best first. Free-tier capacity is shared and
 # genuinely volatile -- measured over two minutes, gemini-3.5-flash-lite went
 # from serving to 503 and gemini-3.8-flash was saturated throughout -- so a
@@ -145,11 +196,12 @@ MODEL_CHAINS = {
 }
 
 
-def _chain(role: str) -> list[str]:
+def _chain(role: str, backend: str | None = None) -> list[str]:
     pinned = os.environ.get(f"TRIAGE_MODEL_{role.upper()}")
     if pinned:
         return [pinned]
-    return (GROQ_CHAINS if backend_name() == "groq" else MODEL_CHAINS)[role]
+    backend = backend or backend_name()
+    return (GROQ_CHAINS if backend == "groq" else MODEL_CHAINS)[role]
 
 
 # Which model actually served each role on the last call. Fallback means the
@@ -201,12 +253,72 @@ def clear_stub() -> None:
     _STUB_RESPONSES.clear()
 
 
-def _call_stub(role: str, system: str, user: str, schema: dict | None) -> Any:
+def _call_stub(
+    role: str, system: str, user: str, schema: dict | None
+) -> tuple[Any, str]:
     if role in _STUB_RESPONSES:
-        return _STUB_RESPONSES[role]
+        return _STUB_RESPONSES[role], "stub"
     raise LLMError(
         f"stub has no response registered for role {role!r} "
         f"(registered: {sorted(_STUB_RESPONSES)})"
+    )
+
+
+# --- demo backend -----------------------------------------------------------
+
+DEMO_PATH = pathlib.Path(__file__).parent / "demo_responses.json"
+_demo_cache: dict[str, Any] | None = None
+
+
+def _demo_key(role: str, user: str) -> str:
+    """Stable key for one recorded call.
+
+    Hashes the full user prompt, not just the ticket: the responder's prompt
+    carries the retrieved chunks and the judge's carries the draft, and both are
+    deterministic given the same index and the same recorded upstream replies.
+    Keying on the whole prompt means a replay that has drifted -- a changed
+    prompt template, a rebuilt index -- misses rather than silently returning a
+    response recorded for different input.
+    """
+    digest = hashlib.sha256(f"{role}\x00{user}".encode()).hexdigest()[:16]
+    return f"{role}:{digest}"
+
+
+def _load_demo() -> dict[str, Any]:
+    global _demo_cache
+    if _demo_cache is None:
+        if DEMO_PATH.exists():
+            _demo_cache = json.loads(DEMO_PATH.read_text())
+        else:
+            _demo_cache = {"responses": {}, "fallback": {}}
+    return _demo_cache
+
+
+def _call_demo(
+    role: str, system: str, user: str, schema: dict | None
+) -> tuple[Any, str]:
+    """Replay a recorded response. Pure lookup: no globals are mutated.
+
+    That purity is the point. The obvious alternative -- flipping TRIAGE_LLM to
+    "stub" and registering canned replies -- mutates process-wide state, so one
+    visitor enabling demo mode would silently serve canned replies to every
+    other session connected at the time.
+    """
+    data = _load_demo()
+    key = _demo_key(role, user)
+
+    if key in data["responses"]:
+        return data["responses"][key], "recorded"
+
+    fallback = data.get("fallback", {}).get(role)
+    if fallback is not None:
+        # An unrecorded ticket. The graph still runs for real; only this reply
+        # is generic, and the caller is told so by the model name.
+        return fallback, "recorded (generic)"
+
+    raise LLMError(
+        f"demo mode has no recorded response for role {role!r}. "
+        f"Regenerate with: python -m triage.record_demo"
     )
 
 
@@ -229,9 +341,11 @@ def _get_client():
     return _client
 
 
-def _call_gemini(role: str, system: str, user: str, schema: dict | None) -> Any:
+def _call_gemini(
+    role: str, system: str, user: str, schema: dict | None
+) -> tuple[Any, str]:
     """Walk the role's model chain until one answers, within a time budget."""
-    chain = _chain(role)
+    chain = _chain(role, "gemini")
     deadline = time.monotonic() + CALL_DEADLINE_SECONDS
 
     # Skip models in cooldown. If every model is cooling down, fall back to the
@@ -247,12 +361,12 @@ def _call_gemini(role: str, system: str, user: str, schema: dict | None) -> Any:
             break
         try:
             result = _generate(model, role, system, user, schema, deadline)
-            _LAST_MODEL[role] = model
+            _LAST_MODEL[role] = model  # kept for REPL/debug convenience only
             if index > 0:
                 logging.getLogger(__name__).warning(
                     "role=%s fell back to %s after %s", role, model, "; ".join(errors_seen)
                 )
-            return result
+            return result, model
         except Exception as exc:
             if _is_daily_quota(exc):
                 # Out of requests for the day on this model. Waiting cannot help;
@@ -384,12 +498,20 @@ def _retry_after(exc: Exception) -> float | None:
 
 
 def _pace() -> None:
-    """Hold every request to a global minimum interval."""
+    """Hold every request to a global minimum interval.
+
+    The lock is held across the sleep and the timestamp write, so concurrent
+    callers queue and each waits its full interval after its predecessor -- a
+    correct token bucket rather than a race. It is released before the API call
+    itself, which must NOT be serialised: those take 5-28s.
+    """
     global _last_request_at
-    gap = time.monotonic() - _last_request_at
-    if gap < MIN_REQUEST_INTERVAL_SECONDS:
-        time.sleep(MIN_REQUEST_INTERVAL_SECONDS - gap)
-    _last_request_at = time.monotonic()
+    with _pace_lock:
+        interval = _min_interval()
+        gap = time.monotonic() - _last_request_at
+        if gap < interval:
+            time.sleep(interval - gap)
+        _last_request_at = time.monotonic()
 
 
 def _is_network(exc: Exception) -> bool:
@@ -483,9 +605,11 @@ def _get_groq_client():
     return _groq_client
 
 
-def _call_groq(role: str, system: str, user: str, schema: dict | None) -> Any:
+def _call_groq(
+    role: str, system: str, user: str, schema: dict | None
+) -> tuple[Any, str]:
     """Walk the role's model chain until one answers, within a time budget."""
-    chain = _chain(role)
+    chain = _chain(role, "groq")
     deadline = time.monotonic() + CALL_DEADLINE_SECONDS
     candidates = [m for m in chain if not _circuit_open(m)] or chain
     errors_seen: list[str] = []
@@ -496,13 +620,13 @@ def _call_groq(role: str, system: str, user: str, schema: dict | None) -> Any:
             break
         try:
             result = _generate_groq(model, role, system, user, schema, deadline)
-            _LAST_MODEL[role] = model
+            _LAST_MODEL[role] = model  # kept for REPL/debug convenience only
             if index > 0:
                 logging.getLogger(__name__).warning(
                     "role=%s fell back to %s after %s",
                     role, model, "; ".join(errors_seen),
                 )
-            return result
+            return result, model
         except Exception as exc:
             if _is_network(exc):
                 raise LLMError(
@@ -595,6 +719,7 @@ def _parse(content: str, schema: dict | None) -> Any:
 _BACKENDS = {
     "gemini": _call_gemini,
     "groq": _call_groq,
+    "demo": _call_demo,
     "stub": _call_stub,
 }
 
@@ -603,37 +728,70 @@ def backend_name() -> str:
     return os.environ.get("TRIAGE_LLM", "gemini").lower()
 
 
-def model_name(role: str | None = None) -> str:
-    """The preferred model, for the CLI header. Use last_model() for what ran."""
-    if backend_name() == "stub":
-        return "stub"
+def model_name(role: str | None = None, backend: str | None = None) -> str:
+    """The preferred model, for a header. Use the value returned by
+    call_with_model() for what actually answered."""
+    backend = backend or backend_name()
+    if backend in ("stub", "demo"):
+        return backend
     if role:
-        return _chain(role)[0]
-    return " + ".join(dict.fromkeys(_chain(r)[0] for r in MODEL_CHAINS))
+        return _chain(role, backend)[0]
+    return " + ".join(
+        dict.fromkeys(_chain(r, backend)[0] for r in MODEL_CHAINS)
+    )
 
 
 def backends() -> list[str]:
     return sorted(_BACKENDS)
 
 
-def call(role: str, system: str, user: str, schema: dict | None = None) -> Any:
-    """Run one model call on behalf of `role`.
+def call_with_model(
+    role: str,
+    system: str,
+    user: str,
+    schema: dict | None = None,
+    backend: str | None = None,
+) -> tuple[Any, str]:
+    """Run one model call on behalf of `role`; return (result, model_that_served).
 
-    With `schema`, returns a parsed dict. Without, returns stripped text.
+    With `schema`, the result is a parsed dict. Without, stripped text.
 
     Transient API failures (429, 5xx) are retried against the same model with
     exponential backoff; a model that stays unavailable is skipped for the next
-    one in the role's chain. `last_model(role)` reports which one answered.
+    one in the role's chain -- so the model that answered is frequently NOT the
+    role's first choice, and the caller is told which one it was.
+
+    Returning the model rather than leaving it in a module global is the point.
+    The global (`_LAST_MODEL`) is written after the call and shared by every
+    thread in the process, so two concurrent runs attribute each other's models.
+    An eval score attributed to the wrong model is worse than no score.
+
+    `backend` selects the backend for this call only, ignoring TRIAGE_LLM. That
+    is what lets one session run against a stub while another runs live, without
+    either changing what the other sees.
     """
     if role not in MODEL_CHAINS:
         raise LLMError(f"unknown role {role!r}; expected one of {sorted(MODEL_CHAINS)}")
 
-    name = backend_name()
+    name = (backend or backend_name()).lower()
     if name not in _BACKENDS:
         raise LLMError(
-            f"unknown TRIAGE_LLM backend {name!r}; expected one of {sorted(_BACKENDS)}"
+            f"unknown backend {name!r}; expected one of {sorted(_BACKENDS)}"
         )
 
     if name == "stub":
         _LAST_MODEL[role] = "stub"
     return _BACKENDS[name](role, system, user, schema)
+
+
+def call(
+    role: str,
+    system: str,
+    user: str,
+    schema: dict | None = None,
+    backend: str | None = None,
+) -> Any:
+    """`call_with_model` without the model. Signature preserved for callers that
+    do not need attribution."""
+    result, _ = call_with_model(role, system, user, schema, backend)
+    return result

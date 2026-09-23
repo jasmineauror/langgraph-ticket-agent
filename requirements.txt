@@ -1,8 +1,18 @@
-langgraph>=0.2
-langchain-core>=0.3
-chromadb>=0.5
-onnxruntime>=1.18
-google-genai>=2.0
-pyyaml>=6.0
-pytest>=8.0
-openai>=1.0
+# Pinned, not floated. `chroma_db/` is committed, so the chromadb version that
+# opens it must be the version that wrote it -- a resolver free to pick a newer
+# release may run a schema migration against the committed sqlite file, or fail
+# to read it at all. numpy is pinned for ABI compatibility with onnxruntime.
+chromadb==1.5.9
+onnxruntime==1.30.0
+numpy==2.5.3
+
+langgraph==1.2.12
+langchain-core==1.6.4
+
+google-genai==2.25.0
+openai==3.19.0
+
+pyyaml==6.0.3
+streamlit>=1.40
+
+pytest==9.1.1

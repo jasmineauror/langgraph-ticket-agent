@@ -1,6 +1,13 @@
 .venv/
 __pycache__/
 *.pyc
-chroma_db/
 .pytest_cache/
 .env
+
+# Local mirror of the deployed Streamlit secrets. Never committed.
+.streamlit/secrets.toml
+
+# NOTE: chroma_db/ is deliberately NOT ignored. The prebuilt index is committed
+# so the deployed app never calls build_index(), which deletes the collection
+# before re-adding it -- fine in a CLI, wrong in a server where another session
+# may hold a live handle to the collection being dropped.

@@ -7,11 +7,12 @@ from ..state import TicketState
 
 
 def classify(state: TicketState) -> TicketState:
-    result = llm.call(
+    result, model = llm.call_with_model(
         role="classifier",
         system=prompts.CLASSIFIER_SYSTEM,
         user=f"Ticket:\n\n{state['ticket_text']}",
         schema=prompts.CLASSIFIER_SCHEMA,
+        backend=state.get("backend") or None,
     )
 
     category = result["category"]
@@ -21,8 +22,9 @@ def classify(state: TicketState) -> TicketState:
         "category": category,
         "auto_answerable": auto_answerable,
         "classifier_reasoning": result.get("reasoning", ""),
+        "served_by": {"classifier": model},
         "trace": [
-            f"[classifier] ({llm.last_model('classifier')}) category={category} "
+            f"[classifier] ({model}) category={category} "
             f"auto_answerable={auto_answerable} -- {result.get('reasoning', '')}"
         ],
     }

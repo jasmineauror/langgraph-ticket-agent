@@ -23,6 +23,20 @@ def _get():
     return _collection
 
 
+def set_collection(collection) -> None:
+    """Install a collection to use instead of opening a new one.
+
+    Exists for long-lived hosts. `get_collection()` constructs a fresh Chroma
+    client AND a fresh ONNX embedding function -- and each embedding function
+    lazily builds its own onnxruntime InferenceSession, ~100-150MB resident. One
+    is the memory budget on a small container, so a host that also needs the
+    collection for its own purposes must share this one rather than open a
+    second.
+    """
+    global _collection
+    _collection = collection
+
+
 def retrieve(state: TicketState) -> TicketState:
     results = _get().query(
         query_texts=[state["ticket_text"]],

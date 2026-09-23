@@ -1,0 +1,49 @@
+# The visual system lives here rather than in injected CSS. Streamlit exposes
+# the whole surface as config, and CSS that reaches into Streamlit's internal
+# class names breaks on minor version bumps.
+#
+# Colours are the dataviz reference palette, stepped for a dark surface and
+# validated against it:
+#   node scripts/validate_palette.js "#3987e5,#d95926,#199e70" \
+#        --mode dark --surface "#1a1a19"
+#   -> ALL CHECKS PASS (worst adjacent CVD dE 9.4, normal-vision dE 26.5,
+#      all >= 3:1 contrast)
+
+[theme]
+base                     = "dark"
+backgroundColor          = "#0d0d0d"   # page plane
+secondaryBackgroundColor = "#1a1a19"   # card / chart surface
+textColor                = "#ffffff"   # primary ink
+primaryColor             = "#3987e5"   # categorical slot 1, dark step
+borderColor              = "#2c2c2a"   # hairline
+linkColor                = "#3987e5"
+codeBackgroundColor      = "#1a1a19"
+codeTextColor            = "#c3c2b7"   # secondary ink
+baseRadius               = "0.5rem"
+buttonRadius             = "0.5rem"
+showWidgetBorder         = true
+font                     = "sans-serif"
+headingFont              = "sans-serif"
+codeFont                 = "monospace"
+baseFontSize             = 15
+
+# Fed to Streamlit's native charts so a chart drawn with st.* picks up the same
+# validated hues rather than Streamlit's defaults.
+chartCategoricalColors = ["#3987e5", "#d95926", "#199e70", "#c98500"]
+chartSequentialColors = [
+  "#cde2fb", "#b7d3f6", "#9ec5f4", "#86b6ef", "#6da7ec", "#5598e7",
+  "#3987e5", "#2a78d6", "#256abf", "#1c5cab", "#184f95", "#104281",
+]
+
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false
+
+[runner]
+# A rerun triggered mid-stream raises inside the running script, aborting the
+# graph and discarding model calls already paid for out of a daily quota. This
+# narrows the window; it does not close it, so the console also hands the ticket
+# off through session_state and disables its inputs on the next run.
+fastReruns = false

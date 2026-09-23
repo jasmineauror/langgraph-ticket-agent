@@ -1,0 +1,113 @@
+{
+  "_note": "Recorded by `python -m triage.record_demo`. Keys are sha256(role + prompt)[:16]. Re-record when prompts, the knowledge base, or the chunker change.",
+  "fallback": {
+    "classifier": {
+      "auto_answerable": true,
+      "category": "billing",
+      "reasoning": "The ticket asks about the availability of a self\u2011hosted/on\u2011premise deployment, its cost, and minimum contract terms\u2014information about product pricing and contract conditions, which falls under the billing category. No direct action on the account or a judgment call is required; it is simply an information request."
+    },
+    "judge": {
+      "addresses_ticket": true,
+      "cites_sources": true,
+      "grounded_in_sources": true,
+      "reason": "All checks passed.",
+      "touches_sensitive": false,
+      "verdict": "SEND"
+    },
+    "responder": {
+      "cited_sources": [],
+      "reply": "INSUFFICIENT_CONTEXT The excerpts do not contain information about self\u2011hosted or on\u2011premise deployment options, pricing, or contract terms."
+    }
+  },
+  "responses": {
+    "classifier:02fd5d6c3a4aa253": {
+      "auto_answerable": false,
+      "category": "abusive_or_out_of_scope",
+      "reasoning": "The ticket contains abusive and threatening language toward the support team and the company. This falls under the abusive_or_out_of_scope category and cannot be automatically answered; it requires human review and action."
+    },
+    "classifier:12eee4f215c9c8e6": {
+      "auto_answerable": true,
+      "category": "technical",
+      "reasoning": "The ticket asks for technical details about API rate limits and how to handle throttling, which is a request for information. No account or billing action is requested, so it is automatically answerable."
+    },
+    "classifier:16b67edc7ac143ed": {
+      "auto_answerable": true,
+      "category": "billing",
+      "reasoning": "The user is asking for information about the refund policy for canceling a plan after six months. This is a billing-related inquiry, not a request to take an action. Therefore it is answerable via documentation, so auto_answerable is true."
+    },
+    "classifier:34540aebfe4127af": {
+      "auto_answerable": true,
+      "category": "billing",
+      "reasoning": "The ticket asks about the availability of a self\u2011hosted/on\u2011premise deployment, its cost, and minimum contract terms\u2014information about product pricing and contract conditions, which falls under the billing category. No direct action on the account or a judgment call is required; it is simply an information request."
+    },
+    "classifier:60e20cff6d7937c4": {
+      "auto_answerable": true,
+      "category": "billing",
+      "reasoning": "The ticket asks for information on how to download invoice PDFs, which is a purely informational question and does not require any action or judgement on the part of a human agent."
+    },
+    "classifier:967afae0f2961c01": {
+      "auto_answerable": true,
+      "category": "technical",
+      "reasoning": "The ticket primarily reports a technical issue with webhook event delivery, which is a request for information. The billing concern, while present, is not an explicit request for action such as a refund or account change, so the ticket can be answered by providing troubleshooting steps and guidance. Thus the ticket is classified under technical and is auto_answerable."
+    },
+    "classifier:d24d712f39bd9b5f": {
+      "auto_answerable": false,
+      "category": "billing",
+      "reasoning": "The user requests a refund and asks for the amount to be returned to their card, which requires processing a refund\u2014a company action that must be performed by a human."
+    },
+    "judge:ce7f13e86495abda": {
+      "addresses_ticket": true,
+      "cites_sources": true,
+      "grounded_in_sources": true,
+      "reason": "All checks passed",
+      "touches_sensitive": false,
+      "verdict": "SEND"
+    },
+    "judge:e59f25fa40351688": {
+      "addresses_ticket": true,
+      "cites_sources": true,
+      "grounded_in_sources": true,
+      "reason": "touches_sensitive",
+      "touches_sensitive": true,
+      "verdict": "ESCALATE"
+    },
+    "judge:ecb6d581e1c7617a": {
+      "addresses_ticket": true,
+      "cites_sources": true,
+      "grounded_in_sources": true,
+      "reason": "All checks passed.",
+      "touches_sensitive": false,
+      "verdict": "SEND"
+    },
+    "responder:0796020a76c59964": {
+      "cited_sources": [
+        "billing-invoices.md"
+      ],
+      "reply": "You can download any invoice PDF from the dashboard by navigating to **Settings\u202f\u2192\u202fBilling\u202f\u2192\u202fInvoice history**. Only workspace members with the Owner or Billing Admin role can see this section."
+    },
+    "responder:d4de309b8bccc651": {
+      "cited_sources": [
+        "tech-webhooks.md",
+        "account-team-members.md"
+      ],
+      "reply": "If your webhook endpoint has been returning errors for an extended period, Meridian will automatically disable it after 24\u202fhours of continuous failures and will email the workspace Owners. You can view those failed deliveries in the endpoint\u2019s Recent deliveries tab (kept for 7\u202fdays) and replay any you wish. Make sure the endpoint returns a 2xx status within 10\u202fseconds; a non\u20112xx response or timeout triggers the retry schedule (1\u202fmin, 5\u202fmin, 30\u202fmin, 2\u202fh, 12\u202fh) and after the final attempt the delivery is marked failed. Also verify the X\u2011Meridian\u2011Signature header as described, to ensure the request is accepted. \n\nRegarding the seats for the two members you removed: removing a member revokes their access immediately, but the seat itself is not credited until the next billing cycle, so you may still be billed for those seats until that time. Charges are applied according to your plan and proration rules, and the seat will be reflected in the next cycle\u2019s invoice."
+    },
+    "responder:dd737e8508dfc167": {
+      "cited_sources": [
+        "tech-api-rate-limits.md"
+      ],
+      "reply": "On the Growth plan the REST API allows 600 requests per minute. If the limit is exceeded the API returns HTTP\u202f429 with a\u202fRetry\u2011After header. Your client should respect the Retry\u2011After value and use exponential backoff with jitter rather than retrying on a fixed interval."
+    },
+    "responder:e52089eee7abd73e": {
+      "cited_sources": [
+        "account-deletion.md",
+        "billing-plan-changes.md"
+      ],
+      "reply": "If you cancel (delete) your workspace, the subscription is cancelled. Any remaining prepaid period is handled case\u2011by\u2011case and is not automatically credited. Additionally, downgrades do not provide partial credit for the unused portion of the period you have already paid for."
+    },
+    "responder:f46326edc3fb3eab": {
+      "cited_sources": [],
+      "reply": "INSUFFICIENT_CONTEXT The excerpts do not contain information about self\u2011hosted or on\u2011premise deployment options, pricing, or contract terms."
+    }
+  }
+}

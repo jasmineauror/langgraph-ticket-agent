@@ -110,11 +110,12 @@ def judge(state: TicketState) -> TicketState:
         f"Knowledge base excerpts the draft was given:\n\n{sources}"
     )
 
-    result = llm.call(
+    result, model = llm.call_with_model(
         role="judge",
         system=prompts.JUDGE_SYSTEM,
         user=user,
         schema=prompts.JUDGE_SCHEMA,
+        backend=state.get("backend") or None,
     )
 
     checks = {
@@ -131,21 +132,26 @@ def judge(state: TicketState) -> TicketState:
     # contradicted itself, and the checks are the more reliable signal.
     # Sensitive is decided once and never revisited.
     if checks["touches_sensitive"]:
-        return _escalate(
+        out = _escalate(
             state,
             f"{reason} (failed: touches_sensitive)",
             checks,
             redraftable=False,
         )
+        out["served_by"] = {"judge": model}
+        return out
 
     failed = [name for name in REDRAFTABLE_CHECKS if not checks[name]]
     if failed:
-        return _escalate(state, f"{reason} (failed: {', '.join(failed)})", checks)
+        out = _escalate(state, f"{reason} (failed: {', '.join(failed)})", checks)
+        out["served_by"] = {"judge": model}
+        return out
 
     return {
         "verdict": "SEND",
         "decided_by": "judge",
         "escalation_reason": "",
         "judge_checks": checks,
-        "trace": [f"[judge] ({llm.last_model('judge')}) SEND -- checks={checks}"],
+        "served_by": {"judge": model},
+        "trace": [f"[judge] ({model}) SEND -- checks={checks}"],
     }

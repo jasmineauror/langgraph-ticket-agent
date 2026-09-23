@@ -22,11 +22,12 @@ def respond(state: TicketState) -> TicketState:
         f"Knowledge base excerpts:\n\n{_format_context(state)}"
     )
 
-    result = llm.call(
+    result, model = llm.call_with_model(
         role="responder",
         system=prompts.RESPONDER_SYSTEM,
         user=user,
         schema=prompts.RESPONDER_SCHEMA,
+        backend=state.get("backend") or None,
     )
 
     reply = result["reply"]
@@ -36,8 +37,9 @@ def respond(state: TicketState) -> TicketState:
         "draft_reply": reply,
         "cited_sources": result.get("cited_sources", []),
         "responder_refused": refused,
+        "served_by": {"responder": model},
         "trace": [
-            f"[responder] ({llm.last_model('responder')}) drafted {len(reply)} chars, "
+            f"[responder] ({model}) drafted {len(reply)} chars, "
             f"cited={result.get('cited_sources', [])}, refused={refused}"
         ],
     }

@@ -23,6 +23,11 @@ class Chunk(TypedDict):
 class TicketState(TypedDict, total=False):
     # --- input ---
     ticket_text: str
+    # Backend for this run only, overriding TRIAGE_LLM. Carried in state rather
+    # than read from the environment because the environment is process-wide: a
+    # UI that flipped it to "stub" for one session would silently serve stub
+    # replies to every other session connected at the time.
+    backend: str
 
     # --- classifier ---
     category: Category
@@ -37,6 +42,13 @@ class TicketState(TypedDict, total=False):
     draft_reply: str
     cited_sources: list[str]
     responder_refused: bool  # the model itself declined to answer
+
+    # Which model actually answered, per role. Populated from the return value
+    # of llm.call_with_model rather than read from a module global, which is
+    # shared across threads and would attribute one run's model to another.
+    # operator.or_ merges each node's single entry; the judge's retry overwrites
+    # its own key, which is the behaviour we want.
+    served_by: Annotated[dict[str, str], operator.or_]
 
     # --- judge ---
     verdict: Verdict
@@ -56,15 +68,21 @@ class TicketState(TypedDict, total=False):
     trace: Annotated[list[str], operator.add]
 
 
-def new_state(ticket_text: str) -> TicketState:
-    """Build the initial state for a ticket."""
+def new_state(ticket_text: str, backend: str | None = None) -> TicketState:
+    """Build the initial state for a ticket.
+
+    `backend` pins this run to one backend ("groq", "gemini", "stub"); omitted,
+    every call falls back to TRIAGE_LLM.
+    """
     return TicketState(
         ticket_text=ticket_text,
+        backend=backend or "",
         retrieved=[],
         max_similarity=0.0,
         cited_sources=[],
         responder_refused=False,
         retry_count=0,
         judge_checks={},
+        served_by={},
         trace=[],
     )

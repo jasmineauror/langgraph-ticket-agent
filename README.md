@@ -128,14 +128,50 @@ TRIAGE_LLM=groq .venv/bin/python -m pytest evals/ -v
 Adding Groq touched only `triage/llm.py`. No node, no prompt, and no fixture
 changed — which is the adapter earning its keep.
 
-## Not deployed anywhere
+## The console
 
-This is a local CLI plus a pytest suite, by design: the graph structure and the
-eval fixtures are the substance, and a UI would not have added any. If you want
-one, **Streamlit** is the natural fit (same language, one file, renders the
-trace easily). Vercel is aimed at JS frontends and would mean running this as a
-Python function with an ephemeral filesystem, so `chroma_db/` would need
-rebuilding on cold start or moving to a hosted vector store.
+```bash
+cp .streamlit/secrets.toml.example .streamlit/secrets.toml   # then edit
+.venv/bin/streamlit run streamlit_app.py
+```
+
+Three pages behind a passcode:
+
+| Page | What it shows |
+|---|---|
+| **Triage Console** | A ticket streaming through the four stages, with retrieval scores against the grounding floor, the judge's rubric, and which model served each role |
+| **Eval Suite** | The seven fixtures run live, with per-assertion results |
+| **Knowledge Base** | All 15 documents and 24 chunks, plus a similarity probe you can point at any query |
+
+The console is built to show the decisions, not hide them. A chat box would
+conceal exactly the parts worth discussing: that `abusive` never reaches the
+retriever, that `no-kb-answer` scores 0.517 — high enough to look relevant,
+too low to answer — and that the responder declines rather than inventing.
+
+### Demo mode
+
+A sidebar toggle runs the whole pipeline with **no API calls and no
+credentials**:
+
+```bash
+TRIAGE_LLM=demo pytest evals/ -q      # 7/7 in under a second, offline
+```
+
+Routing, vector search, both code gates and the judge rubric all execute for
+real; only the model's wording is replayed, from responses recorded off a live
+run by `python -m triage.record_demo`. Keys are a hash of the full prompt, so a
+changed prompt or a rebuilt index *misses* and is labelled generic rather than
+silently returning a reply recorded for different input. A ticket outside the
+recorded set gets a conservative canned response and the UI says so.
+
+It exists because a live demo that depends on a free-tier quota is a demo that
+can fail in front of someone.
+
+### The passcode is not authentication
+
+It is a shared secret over HTTPS with no server-side rate limiting — enough to
+stop a crawler or a forwarded link draining a daily model quota, and nothing
+more. Don't put anything behind it you'd mind a determined person reading.
 
 Structured output is enforced by the API via `response_schema`, which
 constrains decoding. Malformed JSON is therefore not a failure mode the prompts
