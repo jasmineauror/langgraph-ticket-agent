@@ -107,6 +107,36 @@ TRIAGE_MODEL_JUDGE=gemini-2.5-pro .venv/bin/python -m pytest evals/ -v
 TRIAGE_LLM=stub .venv/bin/python -m pytest tests/ -q
 ```
 
+### Backends
+
+| `TRIAGE_LLM` | Models | Free-tier budget |
+|---|---|---|
+| `gemini` (default) | `gemini-3.5-flash-lite`, `gemini-3.5-flash`, `gemini-3-flash-preview` | **20 requests/day/model** |
+| `groq` | `openai/gpt-oss-120b`, `openai/gpt-oss-20b`, `qwen/qwen3.8-27b` | **1,000 requests/day/model** |
+| `stub` | none | unlimited, no network |
+
+A run costs ~15 requests, so Gemini's free tier supports roughly **4 runs a
+day** and Groq's roughly **66**. Groq is the better choice for iterating; both
+support *strict* schema-constrained decoding, so the shape guarantee the nodes
+rely on is identical either way.
+
+```bash
+export GROQ_API_KEY=gsk_...    # free, no card: console.groq.com/keys
+TRIAGE_LLM=groq .venv/bin/python -m pytest evals/ -v
+```
+
+Adding Groq touched only `triage/llm.py`. No node, no prompt, and no fixture
+changed — which is the adapter earning its keep.
+
+## Not deployed anywhere
+
+This is a local CLI plus a pytest suite, by design: the graph structure and the
+eval fixtures are the substance, and a UI would not have added any. If you want
+one, **Streamlit** is the natural fit (same language, one file, renders the
+trace easily). Vercel is aimed at JS frontends and would mean running this as a
+Python function with an ephemeral filesystem, so `chroma_db/` would need
+rebuilding on cold start or moving to a hosted vector store.
+
 Structured output is enforced by the API via `response_schema`, which
 constrains decoding. Malformed JSON is therefore not a failure mode the prompts
 have to defend against.

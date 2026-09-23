@@ -224,3 +224,23 @@ The lesson is not "write assertions." It is that an eval suite spends much of it
 life reporting numbers that are artifacts of its own plumbing, and the real work
 is building enough discrimination into the harness that a plumbing result cannot
 be mistaken for a measurement.
+
+## Stability — is 7/7 repeatable, or was it one lucky sample?
+
+A single passing run is one observation of a nondeterministic system, and
+"it passes" and "it passed once" are different claims. Three consecutive runs:
+
+| Run | Score | Runtime |
+|---|---|---|
+| 1 | 7/7 | 2m12s |
+| 2 | 7/7 | 1m06s |
+| 3 | 7/7 | 1m08s |
+
+**3/3 runs at 7/7**, no assertion failures and no infrastructure errors. The
+runtime drop after run 1 is capacity, not the pipeline -- fewer 503s meant
+fewer fallback hops.
+
+Three samples establishes repeatability, not a stability guarantee. The honest
+claim is "it passed three consecutive runs," and the fixture most likely to
+wobble is `ambiguous-two-issues`, whose `any_of` assertion accepts two
+different correct handlings precisely because the input is genuinely ambiguous.

@@ -1,8 +1,12 @@
 """Single entry point for every model call in the graph.
 
-Two backends, selected by the TRIAGE_LLM env var:
+Three backends, selected by the TRIAGE_LLM env var:
 
     gemini  (default) Gemini via the Google AI API
+    groq    Groq, OpenAI-compatible. Free tier allows 1,000 requests/day/model
+            against Gemini's 20/day/model, which is the difference between ~66
+            eval runs a day and ~4. Same schema guarantee: gpt-oss and qwen
+            support strict constrained decoding.
     stub    deterministic canned responses, for unit tests
 
 Every call names the *role* making it, and each role is bound to its own model
@@ -121,6 +125,14 @@ def circuit_state() -> dict[str, float]:
 # Each role leads with a DIFFERENT model, because the free-tier daily cap is
 # per-model (20/day). Two roles sharing a first choice halves the number of eval
 # runs the day's quota can support.
+GROQ_CHAINS = {
+    # All three support strict structured outputs (constrained decoding), so the
+    # schema guarantee carries over from the Gemini backend unchanged.
+    "classifier": ["openai/gpt-oss-20b", "qwen/qwen3.8-27b", "openai/gpt-oss-120b"],
+    "responder": ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "openai/gpt-oss-20b"],
+    "judge": ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "openai/gpt-oss-20b"],
+}
+
 MODEL_CHAINS = {
     "classifier": ["gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-3-flash-preview"],
     # Responder and judge deliberately lead with DIFFERENT models. Measured:
@@ -135,7 +147,9 @@ MODEL_CHAINS = {
 
 def _chain(role: str) -> list[str]:
     pinned = os.environ.get(f"TRIAGE_MODEL_{role.upper()}")
-    return [pinned] if pinned else MODEL_CHAINS[role]
+    if pinned:
+        return [pinned]
+    return (GROQ_CHAINS if backend_name() == "groq" else MODEL_CHAINS)[role]
 
 
 # Which model actually served each role on the last call. Fallback means the
@@ -331,7 +345,7 @@ def _is_transient(exc: Exception) -> bool:
 
     if isinstance(exc, errors.APIError):
         return getattr(exc, "code", None) in TRANSIENT_STATUS
-    return False
+    return getattr(exc, "status_code", None) in TRANSIENT_STATUS
 
 
 def _is_quota(exc: Exception) -> bool:
@@ -340,7 +354,8 @@ def _is_quota(exc: Exception) -> bool:
 
     if isinstance(exc, errors.APIError):
         return getattr(exc, "code", None) in QUOTA_STATUS
-    return False
+    # Groq / OpenAI-compatible clients surface the status differently.
+    return getattr(exc, "status_code", None) in QUOTA_STATUS
 
 
 def _is_daily_quota(exc: Exception) -> bool:
@@ -446,6 +461,117 @@ def _finish_reason(response) -> str | None:
         return None
 
 
+# --- groq backend (OpenAI-compatible) ---------------------------------------
+
+_groq_client = None
+
+
+def _get_groq_client():
+    global _groq_client
+    if _groq_client is None:
+        from openai import OpenAI
+
+        key = os.environ.get("GROQ_API_KEY")
+        if not key:
+            raise LLMError(
+                "no API key found: set GROQ_API_KEY (free key from "
+                "https://console.groq.com/keys)"
+            )
+        _groq_client = OpenAI(
+            api_key=key, base_url="https://api.groq.com/openai/v1"
+        )
+    return _groq_client
+
+
+def _call_groq(role: str, system: str, user: str, schema: dict | None) -> Any:
+    """Walk the role's model chain until one answers, within a time budget."""
+    chain = _chain(role)
+    deadline = time.monotonic() + CALL_DEADLINE_SECONDS
+    candidates = [m for m in chain if not _circuit_open(m)] or chain
+    errors_seen: list[str] = []
+
+    for index, model in enumerate(candidates):
+        if time.monotonic() > deadline and index > 0:
+            errors_seen.append("deadline exceeded")
+            break
+        try:
+            result = _generate_groq(model, role, system, user, schema, deadline)
+            _LAST_MODEL[role] = model
+            if index > 0:
+                logging.getLogger(__name__).warning(
+                    "role=%s fell back to %s after %s",
+                    role, model, "; ".join(errors_seen),
+                )
+            return result
+        except Exception as exc:
+            if _is_network(exc):
+                raise LLMError(
+                    f"network failure in role {role!r} ({type(exc).__name__}: "
+                    f"{exc}). Every model is unreachable, so this is "
+                    f"connectivity, not capacity."
+                ) from exc
+            status = getattr(exc, "status_code", None)
+            if status in {403, 404} or status in CAPACITY_STATUS:
+                _trip_circuit(model)
+            errors_seen.append(f"{model}: {type(exc).__name__}"
+                               + (f"({status})" if status else ""))
+            continue
+
+    raise LLMError(f"every model for role {role!r} failed -- {'; '.join(errors_seen)}")
+
+
+def _generate_groq(
+    model: str, role: str, system: str, user: str, schema: dict | None, deadline: float
+) -> Any:
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "max_completion_tokens": MAX_OUTPUT_TOKENS[role],
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    }
+    if schema is not None:
+        # strict: true gives constrained decoding on gpt-oss and qwen, the same
+        # guarantee Gemini's response_schema provides.
+        kwargs["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": f"{role}_output",
+                "strict": True,
+                "schema": _strictify(schema),
+            },
+        }
+
+    response = _retry_transient(
+        lambda: _get_groq_client().chat.completions.create(**kwargs),
+        label=f"{role}/{model}",
+        deadline=deadline,
+    )
+    text = response.choices[0].message.content
+    if not text:
+        raise LLMError(
+            f"empty response from {model} in role {role!r} "
+            f"(finish_reason={response.choices[0].finish_reason!r})"
+        )
+    return _parse(text, schema)
+
+
+def _strictify(schema: dict) -> dict:
+    """OpenAI strict mode requires additionalProperties:false on every object."""
+    if not isinstance(schema, dict):
+        return schema
+    out = dict(schema)
+    if out.get("type") == "object":
+        out["additionalProperties"] = False
+        out["properties"] = {
+            k: _strictify(v) for k, v in out.get("properties", {}).items()
+        }
+    if out.get("type") == "array" and "items" in out:
+        out["items"] = _strictify(out["items"])
+    return out
+
+
 # --- shared -----------------------------------------------------------------
 
 
@@ -468,6 +594,7 @@ def _parse(content: str, schema: dict | None) -> Any:
 
 _BACKENDS = {
     "gemini": _call_gemini,
+    "groq": _call_groq,
     "stub": _call_stub,
 }
 
@@ -483,6 +610,10 @@ def model_name(role: str | None = None) -> str:
     if role:
         return _chain(role)[0]
     return " + ".join(dict.fromkeys(_chain(r)[0] for r in MODEL_CHAINS))
+
+
+def backends() -> list[str]:
+    return sorted(_BACKENDS)
 
 
 def call(role: str, system: str, user: str, schema: dict | None = None) -> Any:
