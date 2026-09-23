@@ -24,6 +24,28 @@ Two conditional edges make this a graph rather than a chain: the classifier
 short-circuit (never spend retrieval and drafting on an abusive ticket) and the
 judge's retry-or-escalate branch, with retries capped at one.
 
+## Results
+
+```
+EVAL SCORE: 7/7 passed
+  [PASS ] normal-billing          [PASS ] refund-request-action
+  [PASS ] technical-in-kb         [PASS ] refund-policy-question
+  [PASS ] abusive                 [PASS ] no-kb-answer
+                                  [PASS ] ambiguous-two-issues
+```
+
+Plus 30 unit tests in 0.3s against a stubbed model.
+
+That score took three rounds of prompt iteration and **five rounds where the
+harness turned out to be measuring itself** — a DNS outage that looked like six
+prompt failures, four fixtures passing without ever reaching the retriever, a
+429 misread as a 503 so the suite disabled its own fallbacks, and a reporter of
+mine that printed "3/3 passed" while four of seven fixtures never ran.
+
+[docs/eval-log.md](docs/eval-log.md) records every round with the actual
+hallucinated drafts, the hypothesis, the change, and the new score. It is the
+most useful file in the repo.
+
 ## Setup
 
 ```bash
@@ -53,7 +75,7 @@ export GEMINI_API_KEY=...        # free, no card: aistudio.google.com/apikey
 | `triage/nodes/` | The four nodes |
 | `triage/graph.py` | Wiring and conditional edges |
 | `triage/index.py` | Builds the Chroma collection from `triage/kb/` |
-| `evals/fixtures.yaml` | Six tickets with declarative behavioral assertions |
+| `evals/fixtures.yaml` | Seven tickets with declarative behavioral assertions |
 | `evals/assertions.py` | The assertion engine, unit-tested separately |
 | `docs/eval-log.md` | What the evals caught and what changed in response |
 
@@ -62,11 +84,16 @@ export GEMINI_API_KEY=...        # free, no card: aistudio.google.com/apikey
 Every model call goes through `triage/llm.py` and names the role making it.
 Each role is bound to its own model:
 
-| Role | Model | Thinking | Why |
+| Role | Model (first choice) | Thinking | Why |
 |---|---|---|---|
 | Classifier | `gemini-3.5-flash-lite` | `MINIMAL` | Picks one of four fixed labels. |
-| Responder | `gemini-3.8-flash` | `LOW` | Rewrites retrieved text. |
-| Judge | `gemini-3.8-flash` | `HIGH` | Weighs four competing conditions; its mistakes reach the customer. |
+| Responder | `gemini-3.5-flash` | `LOW` | Rewrites retrieved text. |
+| Judge | `gemini-3-flash-preview` | `HIGH` | Weighs four competing conditions; its mistakes reach the customer. |
+
+Each role walks an ordered **fallback chain**, and the three roles lead with
+three *different* models on purpose: the free tier caps requests at **20 per day
+per model**, so two roles sharing a first choice halves the number of eval runs
+a day's quota supports. `triage/llm.py` holds the chains.
 
 Routing the mechanical call to the cheap model and reserving the expensive one
 for the node whose mistakes are costly is a deliberate choice, and it makes the

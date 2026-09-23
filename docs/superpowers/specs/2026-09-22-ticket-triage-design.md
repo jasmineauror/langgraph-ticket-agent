@@ -30,7 +30,7 @@ Non-goals: no UI, no hosted infra, no scraped data, no deployment.
 | Graph | `langgraph`, `langchain-core` | The thing being practiced |
 | Vector DB | `chromadb`, persistent at `./chroma_db` | Real collections, metadata filters, distance scores |
 | Embeddings | `sentence-transformers`, `all-MiniLM-L6-v2` | Offline, free, adequate for a ~15-doc KB |
-| LLM | Gemini API, per-role models | `gemini-3.5-flash-lite` classifies, `gemini-3.8-flash` responds and judges; schema-constrained output, and a real free tier |
+| LLM | Gemini API, per-role fallback chains | `gemini-3.5-flash-lite` classifies, `gemini-3.5-flash` responds, `gemini-3-flash-preview` judges; schema-constrained output, and a real free tier |
 | Eval harness | `pytest` | Fixture-per-test, familiar output |
 
 **Total cost: $0.** Every model used here is available on Gemini's free tier,
@@ -143,7 +143,7 @@ than a contrived gap.
 
 ## Eval layer
 
-`evals/fixtures.yaml` — six hand-written tickets with declarative assertions:
+`evals/fixtures.yaml` — seven hand-written tickets with declarative assertions:
 
 | Fixture | Assertions |
 |---|---|
@@ -152,6 +152,17 @@ than a contrived gap.
 | Refund request | `must_escalate` (sensitive), `must_not_auto_reply` |
 | Question with no KB answer | `must_escalate`, `must_not_contain` invented specifics |
 | Ambiguous two-issue ticket | asserted explicitly, either escalate or address both |
+| Refund *policy question* (added later) | `must_escalate`, `terminated_by: judge` |
+
+Added after mechanism assertions revealed a coverage gap: the only sensitive
+fixture was a refund *request*, which the classifier correctly catches before
+retrieval — so nothing exercised the judge's sensitive-topic path at all. The
+pair now distinguishes **action** (classifier's job) from **information**
+(judge's job).
+
+Every fixture also asserts `terminated_by`, and where relevant
+`must_reach_retriever`. An earlier version checked only outcomes and reported
+5/6 passing while four fixtures never reached the retriever.
 | Technical question in KB | `must_auto_reply`, `must_cite_source` naming the doc |
 
 `evals/test_evals.py` runs one pytest case per fixture. Assertion vocabulary:
@@ -207,5 +218,5 @@ docs/
 | Model emits malformed JSON | `response_schema` constrains decoding at the API level; the adapter still recovers from a code fence and retries once |
 | A fixture fails from model capability, not prompt quality | Raise that role's model via `TRIAGE_MODEL_<ROLE>`; the comparison is itself a deliverable |
 | Thinking tokens silently truncate the answer | Thinking draws from `max_output_tokens`; ceilings are sized for thinking plus answer, and an empty response raises with the finish reason |
-| Free-tier rate limit throttles the eval loop | Six fixtures per run is well inside per-minute limits; the adapter retries once |
+| Free-tier quota blocks the eval loop | **Measured wrong at design time.** The cap is not per-minute but 20 requests per DAY per model (`GenerateRequestsPerDayPerProjectPerModel-FreeTier`), so pacing requests further apart does nothing. Mitigated by giving each role a different first-choice model, and by benching a model for the session once its daily quota is gone. ~15 requests per run means roughly 4 runs/day on three models. |
 | Judge retry loop spins | `retry_count` hard-capped at 1 |
