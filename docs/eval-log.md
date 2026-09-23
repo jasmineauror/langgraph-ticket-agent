@@ -60,3 +60,167 @@ any cutoff in the 0.35-0.45 range separates "nothing remotely relevant" from
 The threshold stays in the design, demoted from primary mechanism to floor.
 
 ---
+
+## Round 1 — Baseline: the naive prompts, measured
+
+First clean run. All 7 fixtures executed, no infrastructure errors.
+
+**Score: 5/7.** Both failures were real, and both were the designed ones.
+
+### `no-kb-answer` — confident hallucination, zero citations
+
+max_similarity 0.517, `cited_sources: []`, outcome AUTO_REPLY:
+
+> "Currently, Meridian is offered exclusively as a cloud SaaS solution, and we
+> do not provide a self-hosted or on-premise deployment option at this time."
+
+Nothing in the knowledge base says this. The model asserted a fact about product
+availability, cited nothing, and the judge sent it.
+
+Worth noting how it evaded the content assertions: the forbidden-substring list
+was written for *positive* hallucination (`$`, "yes, we offer"). It hallucinated
+in the **negative** direction — "we do not provide" — and only `must_escalate`
+caught it. A claim about what a product lacks is just as much a claim.
+
+### `refund-policy-question` — right sentence, wrong question
+
+> "any remaining prepaid period is handled on a case-by-case basis and is not
+> automatically credited."
+
+That sentence is genuinely in the knowledge base — in `account-deletion.md`,
+about deleting a workspace. The ticket asked about cancelling an annual plan.
+Retrieval surfaced a real passage and the responder applied it to a different
+question. Technically sourced, contextually wrong, cited as nothing.
+
+This failure mode is more dangerous than invention, because it survives a
+"is this grounded in the sources?" check answered carelessly. The passage *is*
+in the sources. It just does not answer what was asked.
+
+**Hypotheses:**
+1. The responder prompt says to use excerpts "if they are helpful" — permission
+   to ignore them, with no refusal path and no citation requirement.
+2. The judge checks only `addresses_ticket`. Both bad drafts *did* address the
+   ticket. The check was satisfied by drafts that were wrong.
+3. The grounding floor decided in round 0 was never implemented. Documented as
+   settled, absent from the code.
+
+---
+
+## Round 2 — Fix the prompts and build the gate
+
+**Changes:**
+
+*Responder* — five ordered rules replacing "use them if they are helpful":
+every claim traceable to an excerpt; **a negative claim needs evidence exactly
+as much as a positive one**; check the excerpt answers *the question asked*, not
+a related one; emit `INSUFFICIENT_CONTEXT` when the excerpts fall short, framed
+as a correct outcome rather than a failure; populate `cited_sources` or you
+should have refused.
+
+*Judge* — four checks replacing one, with the rubric **enforced in code**:
+`addresses_ticket`, `grounded_in_sources`, `touches_sensitive`, `cites_sources`.
+SEND requires all three positives true and sensitive false. A model that reports
+`grounded_in_sources: false` and then returns SEND has contradicted itself, so
+the checks decide, not the verdict field.
+
+*Judge code gates* — finally implementing round 0's decision. Two conditions are
+facts about state rather than matters of opinion, so they run before any model
+call: the responder explicitly refused, or `max_similarity < 0.40`. The floor
+sits well below the 0.517-0.587 band on purpose. It claims only what the scores
+support — "nothing retrieved is on this subject" — and leaves the
+on-topic-but-unanswered case to the grounding check, which reads the text.
+
+**Score: 5/7 — and the failures moved, which is the actual result.**
+
+| Fixture | Round 1 | Round 2 |
+|---|---|---|
+| `refund-policy-question` | FAIL, invented a policy | **PASS** |
+| `no-kb-answer` | FAIL, hallucinated availability | FAIL, *different cause* |
+| `technical-in-kb` | PASS | FAIL, *new* |
+
+`no-kb-answer` now behaves exactly as designed:
+
+```
+[responder] refused=True
+[judge]     RETRY    -- responder declined
+[responder] refused=True
+[judge]     ESCALATE -- {'responder_refused': True}
+outcome:    ESCALATE
+```
+
+It failed on `must_not_contain: ["minimum contract"]` because the refusal *names
+what is missing*: "the knowledge base does not contain information about
+self-hosted or on-premise deployment options, their costs, or minimum
+contracts."
+
+And `technical-in-kb` produced a correct, grounded, correctly-cited reply —
+"the API rate limit is 600 requests per minute. When throttled, clients should
+honor the Retry-After header and apply exponential backoff with jitter" — which
+failed because the fixture demanded the literal string `"429"`.
+
+**Both failures were the fixtures, not the system.**
+
+---
+
+## Round 3 — Fix the assertions
+
+Two assertion-design bugs, both the same underlying error: **testing the wording
+I imagined instead of the behaviour I required.**
+
+1. `must_not_contain` now **exempts an explicit refusal**. Refusing to answer and
+   asserting a falsehood are opposite behaviours and cannot share one substring
+   check — a refusal necessarily echoes the question's vocabulary. A
+   non-refusing draft is still checked, so a real hallucination is still caught;
+   there are unit tests for both directions.
+
+2. Added `must_contain_any` for assertions on substance rather than one token.
+   The throttling half of `technical-in-kb` is answered correctly by naming the
+   status code **or** the correct client behaviour.
+
+This is the least glamorous round and the one I would bring up first. Rounds 1-2
+improved the system; round 3 improved the *instrument*, after it scored a
+correct escalation as a failure and a correct answer as incomplete. An eval that
+is over-fitted to expected phrasing punishes correct behaviour it did not
+anticipate, and the punishment looks exactly like a regression.
+
+**Score: 7/7.** All fixtures measured, no infrastructure errors.
+
+---
+
+## Appendix — Five rounds where the harness measured itself
+
+Every obstacle before round 1 was infrastructure wearing a result's clothing.
+Recording them because the pattern is the most transferable thing here.
+
+| # | Reported | Actually was |
+|---|---|---|
+| 1 | 6 prompt failures | DNS dropped mid-run; network errors bypassed retry entirely |
+| 2 | (2h05m hang) | Retry amplification: 5 attempts x 3 models x 5 calls x 6 fixtures |
+| 3 | 5/6 passing | Classifier short-circuited 4 fixtures past the retriever; assertions checked outcome, never mechanism |
+| 4 | "every model failed" | 429 read as 503, tripping circuit breakers on healthy models — the suite disabled its own fallbacks |
+| 5 | **"3/3 passed"** | 4 of 7 fixtures never ran; `RESULTS` was appended only after assertions, so errors left the denominator |
+
+Round 4 also corrected a factual error in my own reasoning. I asserted quota was
+per-project and built logic on it: never walk the chain, never trip the circuit,
+just pace slower. The `quotaId` in the error payload said
+`GenerateRequestsPerDayPerProjectPerModel-FreeTier`, value 20 — **per day, per
+model**. So each model has its own bucket (walking the chain is right), and
+pacing tunes an axis a daily cap does not have.
+
+What the harness grew in response, each item paid for by a specific wrong number:
+
+- **Preflight check** — one cheap call before the suite; refuses to emit a score
+  at all if the API is unreachable
+- **`terminated_by` / `must_reach_retriever`** — assert the mechanism, so a right
+  answer from the wrong node fails
+- **Three-way failure taxonomy** — capacity (next model), quota (wait, or bench
+  the model for the day), network (fail fast, say it is connectivity)
+- **Denominator = fixtures declared**, never fixtures survived, with unmeasured
+  fixtures called out as infrastructure rather than folded into the score
+- **Stub keyed by role**, not by prompt substring, so rewriting a prompt cannot
+  break three routing tests
+
+The lesson is not "write assertions." It is that an eval suite spends much of its
+life reporting numbers that are artifacts of its own plumbing, and the real work
+is building enough discrimination into the harness that a plumbing result cannot
+be mistaken for a measurement.

@@ -41,9 +41,18 @@ logging.getLogger("google_genai.models").setLevel(logging.ERROR)
 #
 #   503 -- THIS MODEL is saturated. Account quota is fine. Walk to the next
 #          model in the chain and remember this one is down.
-#   429 -- WE are over quota. Every model shares the project's rate limit, so
-#          walking the chain cannot help and tripping circuits just burns the
-#          fallbacks we will need in a moment. Slow down, same model.
+#   429 -- over quota, and the SHAPE of the quota decides what to do. The error
+#          carries a quotaId. Two kinds matter:
+#            *PerDay*  -- a daily cap, and it is PerProjectPerModel: each model
+#                         has its own bucket (free tier: 20 requests/day/model).
+#                         Waiting is useless, so move to the next model and keep
+#                         this one out for the rest of the session.
+#            per-minute -- clears on its own. Wait it out on the same model.
+#
+#          I originally read 429 as a single project-wide rate limit and built
+#          the opposite behaviour: never walk the chain, never trip the circuit,
+#          just pace requests further apart. The quotaId proved that wrong on
+#          every count -- pacing tunes an axis a daily cap does not have.
 #   network -- nothing is reachable. Neither capacity nor quota. Fail fast and
 #          say so, rather than multiplying the wait by the chain length.
 #
@@ -57,8 +66,10 @@ TRANSIENT_STATUS = CAPACITY_STATUS | QUOTA_STATUS
 # Free-tier quota is per-minute, and a 7-fixture suite fires ~25 requests in
 # under a minute. Pacing every request through one global minimum interval keeps
 # the suite inside the limit instead of discovering it by being throttled.
-MIN_REQUEST_INTERVAL_SECONDS = float(os.environ.get("TRIAGE_MIN_INTERVAL", "6.0"))
+MIN_REQUEST_INTERVAL_SECONDS = float(os.environ.get("TRIAGE_MIN_INTERVAL", "1.5"))
 QUOTA_BACKOFF_SECONDS = 20.0
+# A model whose DAILY quota is gone will not recover within this session.
+DAILY_EXHAUSTED_COOLDOWN_SECONDS = 86_400.0
 _last_request_at = 0.0
 
 # Retry budgets, sized against a lesson learned the expensive way. An earlier
@@ -107,15 +118,18 @@ def circuit_state() -> dict[str, float]:
 # Set TRIAGE_MODEL_<ROLE> to pin a role to exactly one model, which is what you
 # want when benchmarking: a fallback that silently swaps the model would make
 # the eval result ambiguous.
+# Each role leads with a DIFFERENT model, because the free-tier daily cap is
+# per-model (20/day). Two roles sharing a first choice halves the number of eval
+# runs the day's quota can support.
 MODEL_CHAINS = {
-    "classifier": ["gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-3-flash-preview"],
+    "classifier": ["gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-3-flash-preview"],
     # Responder and judge deliberately lead with DIFFERENT models. Measured:
     # the classifier on flash-lite was never throttled while responder and judge
     # -- both pointed at gemini-3.8-flash -- were rate limited on every fixture
     # that reached them. Quota appears to be tracked per model family, so two
     # roles sharing a first choice means two roles competing for one bucket.
-    "responder": ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3-flash-preview"],
-    "judge": ["gemini-3.6-flash", "gemini-3-flash-preview", "gemini-3.8-flash"],
+    "responder": ["gemini-3.5-flash", "gemini-3-flash-preview", "gemini-3.5-flash-lite"],
+    "judge": ["gemini-3-flash-preview", "gemini-3.5-flash", "gemini-3.5-flash-lite"],
 }
 
 
@@ -158,7 +172,14 @@ _STUB_RESPONSES: dict[str, Any] = {}
 
 
 def set_stub(key: str, value: Any) -> None:
-    """Register a canned response. `key` is matched as a substring of the prompt."""
+    """Register a canned response, keyed by role name.
+
+    Keyed by role rather than by a substring of the prompt. The earlier version
+    matched prompt text, which silently coupled every unit test to the exact
+    wording of a system prompt -- rewriting the responder prompt broke three
+    routing tests that have nothing to do with prompt wording. Role is the
+    stable identifier.
+    """
     _STUB_RESPONSES[key] = value
 
 
@@ -167,10 +188,12 @@ def clear_stub() -> None:
 
 
 def _call_stub(role: str, system: str, user: str, schema: dict | None) -> Any:
-    for key, value in _STUB_RESPONSES.items():
-        if key in system or key in user:
-            return value
-    raise LLMError(f"stub has no response registered for prompt: {user[:80]!r}")
+    if role in _STUB_RESPONSES:
+        return _STUB_RESPONSES[role]
+    raise LLMError(
+        f"stub has no response registered for role {role!r} "
+        f"(registered: {sorted(_STUB_RESPONSES)})"
+    )
 
 
 # --- gemini backend ---------------------------------------------------------
@@ -217,12 +240,17 @@ def _call_gemini(role: str, system: str, user: str, schema: dict | None) -> Any:
                 )
             return result
         except Exception as exc:
+            if _is_daily_quota(exc):
+                # Out of requests for the day on this model. Waiting cannot help;
+                # the next model has its own daily bucket.
+                _circuit[model] = time.monotonic() + DAILY_EXHAUSTED_COOLDOWN_SECONDS
+                errors_seen.append(f"{model}: daily quota exhausted")
+                continue
             if _is_quota(exc):
                 raise LLMError(
-                    f"rate limited in role {role!r} after {QUOTA_MAX_ATTEMPTS} attempts. "
-                    f"Quota is per-project, so every model shares it -- this is "
-                    f"throttling, not capacity. Raise TRIAGE_MIN_INTERVAL to pace "
-                    f"the suite more slowly."
+                    f"rate limited in role {role!r} after {QUOTA_MAX_ATTEMPTS} "
+                    f"attempts on a per-minute quota. Raise TRIAGE_MIN_INTERVAL "
+                    f"to pace the suite more slowly."
                 ) from exc
             if _is_network(exc):
                 raise LLMError(
@@ -244,8 +272,16 @@ def _call_gemini(role: str, system: str, user: str, schema: dict | None) -> Any:
             )
             continue
 
+    exhausted = [e for e in errors_seen if "daily quota" in e]
+    hint = (
+        "\nEvery model for this role is out of free-tier requests for the day "
+        "(20/day/model). Options: wait for the quota to reset, enable billing on "
+        "the project, or add unused models to this role's chain."
+        if len(exhausted) == len(errors_seen) and exhausted
+        else ""
+    )
     raise LLMError(
-        f"every model for role {role!r} failed -- {'; '.join(errors_seen)}"
+        f"every model for role {role!r} failed -- {'; '.join(errors_seen)}{hint}"
     )
 
 
@@ -305,6 +341,18 @@ def _is_quota(exc: Exception) -> bool:
     if isinstance(exc, errors.APIError):
         return getattr(exc, "code", None) in QUOTA_STATUS
     return False
+
+
+def _is_daily_quota(exc: Exception) -> bool:
+    """A per-day cap rather than a per-minute rate limit.
+
+    Read from the quotaId in the error payload (e.g.
+    "GenerateRequestsPerDayPerProjectPerModel-FreeTier") rather than guessed at,
+    because the two look identical as HTTP 429 and call for opposite responses.
+    """
+    if not _is_quota(exc):
+        return False
+    return "perday" in str(getattr(exc, "details", "") or exc).lower().replace("_", "")
 
 
 def _retry_after(exc: Exception) -> float | None:
@@ -370,6 +418,8 @@ def _retry_transient(thunk, label: str, deadline: float):
         except Exception as exc:
             if not (_is_transient(exc) or _is_network(exc)):
                 raise
+            if _is_daily_quota(exc):
+                raise  # no amount of waiting returns today's quota
             budget = QUOTA_MAX_ATTEMPTS if _is_quota(exc) else MAX_ATTEMPTS
             attempt += 1
             if attempt >= budget:

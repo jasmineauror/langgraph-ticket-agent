@@ -119,3 +119,40 @@ def test_must_reach_retriever_catches_a_short_circuit():
 def test_must_reach_retriever_passes_when_chunks_were_retrieved():
     state = _state(retrieved=[{"text": "x", "source": "a.md", "distance": 0.3}])
     assert check({"must_reach_retriever": True}, state) == []
+
+
+def test_must_contain_any_passes_when_one_member_appears():
+    state = _state(draft_reply="Honor the Retry-After header and back off.")
+    assert check({"must_contain_any": [["429", "retry-after", "backoff"]]}, state) == []
+
+
+def test_must_contain_any_fails_when_no_member_appears():
+    state = _state(draft_reply="Try again later, maybe.")
+    failures = check({"must_contain_any": [["429", "retry-after", "backoff"]]}, state)
+    assert len(failures) == 1
+    assert "none of" in failures[0]
+
+
+def test_refusal_is_exempt_from_must_not_contain():
+    """A refusal names what is missing, so it echoes the question's words.
+
+    Scoring that as a hallucination marked a correct escalation as a failure.
+    """
+    state = _state(
+        verdict="ESCALATE",
+        responder_refused=True,
+        draft_reply=(
+            "INSUFFICIENT_CONTEXT. The knowledge base does not contain "
+            "information about costs or minimum contracts."
+        ),
+    )
+    assert check({"must_not_contain": ["minimum contract", "$"]}, state) == []
+
+
+def test_a_real_hallucination_is_still_caught_when_not_refusing():
+    state = _state(
+        responder_refused=False,
+        draft_reply="Yes, on-premise starts at $40,000 with a minimum contract.",
+    )
+    failures = check({"must_not_contain": ["minimum contract", "$"]}, state)
+    assert len(failures) == 2

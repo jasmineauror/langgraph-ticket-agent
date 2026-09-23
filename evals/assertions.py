@@ -76,13 +76,29 @@ def check(assertions: dict[str, Any], state: TicketState) -> list[str]:
         if needle.lower() not in reply_lower:
             failures.append(f"reply missing required substring {needle!r}")
 
-    # Checked against the draft whenever one exists, even if the judge
-    # escalated it. A draft that says "I have processed your refund" is a
-    # Responder bug regardless of whether the Judge caught it downstream --
-    # and keeping the check unconditional is what tells you that fixing the
-    # Judge alone did not fix the Responder.
-    for needle in assertions.get("must_not_contain", []):
-        if reply and needle.lower() in reply_lower:
-            failures.append(f"reply contains forbidden substring {needle!r}")
+    # Asserting one exact token tests the wording you imagined rather than the
+    # substance you require: a reply saying "honor the Retry-After header and
+    # apply exponential backoff" answers a throttling question correctly without
+    # ever printing "429". Any-of keeps the assertion on the substance.
+    for group in assertions.get("must_contain_any", []):
+        if not any(needle.lower() in reply_lower for needle in group):
+            failures.append(
+                f"reply contains none of {group!r}; at least one is required"
+            )
+
+    # Checked against the draft whenever one exists, even if the judge escalated
+    # it: a draft saying "I have processed your refund" is a Responder bug
+    # whether or not the Judge caught it downstream.
+    #
+    # The one exception is an explicit refusal. A refusal names what is missing
+    # ("the knowledge base does not contain information about ... minimum
+    # contracts"), so it necessarily echoes the question's vocabulary and trips
+    # a forbidden-substring list aimed at hallucinations. Measured: this scored
+    # a correct escalation as a failure. Refusing to answer and asserting a
+    # falsehood are opposite behaviours and cannot share one text check.
+    if not state.get("responder_refused"):
+        for needle in assertions.get("must_not_contain", []):
+            if reply and needle.lower() in reply_lower:
+                failures.append(f"reply contains forbidden substring {needle!r}")
 
     return failures

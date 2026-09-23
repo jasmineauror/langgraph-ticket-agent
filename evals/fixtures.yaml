@@ -8,6 +8,7 @@
 #   must_reach_retriever  the ticket must not be short-circuited before retrieval
 #   must_cite_source      these sources must appear in cited_sources
 #   must_contain          these substrings must appear in the reply
+#   must_contain_any      each group: at least one member must appear
 #   must_not_contain      these substrings must NOT appear in the reply
 #   expected_category     classifier must produce this category
 #   expected_reason       escalation_reason must contain this
@@ -47,7 +48,13 @@
     terminated_by: judge
     must_auto_reply: true
     must_cite_source: [tech-api-rate-limits.md]
-    must_contain: ["600", "429"]
+    must_contain: ["600"]
+    # The throttling half of the question is answered correctly by naming the
+    # status code OR the correct client behaviour. Demanding the literal "429"
+    # failed a reply that said "honor the Retry-After header and apply
+    # exponential backoff" -- correct, grounded, and cited.
+    must_contain_any:
+      - ["429", "retry-after", "backoff"]
 
 - id: abusive
   why: >
