@@ -37,9 +37,66 @@ logging.getLogger("google_genai.models").setLevel(logging.ERROR)
 # exceptional. An eval suite that dies on the first blip is not measuring the
 # prompts, so transient failures are retried with exponential backoff and
 # jitter; 4xx other than 429 is a real bug and fails immediately.
-TRANSIENT_STATUS = {429, 500, 502, 503, 504}
-MAX_ATTEMPTS = 4
-BACKOFF_BASE_SECONDS = 1.5
+# Three failure classes that look alike and need opposite responses:
+#
+#   503 -- THIS MODEL is saturated. Account quota is fine. Walk to the next
+#          model in the chain and remember this one is down.
+#   429 -- WE are over quota. Every model shares the project's rate limit, so
+#          walking the chain cannot help and tripping circuits just burns the
+#          fallbacks we will need in a moment. Slow down, same model.
+#   network -- nothing is reachable. Neither capacity nor quota. Fail fast and
+#          say so, rather than multiplying the wait by the chain length.
+#
+# Conflating 429 with 503 was a real bug here: a rate limit was tripping the
+# circuit breaker on healthy models, so the suite disabled its own fallbacks
+# and then failed with "every model failed" when none of them were broken.
+CAPACITY_STATUS = {500, 502, 503, 504}
+QUOTA_STATUS = {429}
+TRANSIENT_STATUS = CAPACITY_STATUS | QUOTA_STATUS
+
+# Free-tier quota is per-minute, and a 7-fixture suite fires ~25 requests in
+# under a minute. Pacing every request through one global minimum interval keeps
+# the suite inside the limit instead of discovering it by being throttled.
+MIN_REQUEST_INTERVAL_SECONDS = float(os.environ.get("TRIAGE_MIN_INTERVAL", "6.0"))
+QUOTA_BACKOFF_SECONDS = 20.0
+_last_request_at = 0.0
+
+# Retry budgets, sized against a lesson learned the expensive way. An earlier
+# version used 5 attempts per model across a 3-model chain with no global
+# ceiling. Because a saturated model takes 5-28s just to *return* its 503, and
+# because every call re-probed models already known to be down, the suite
+# multiplied out to ~450 requests and ran for 2h05m before being killed.
+#
+# Retry amplification is the failure mode: attempts x models x calls-per-fixture
+# x fixtures. Three things bound it now -- few attempts per model (the chain,
+# not the retry loop, provides redundancy), a hard wall-clock deadline per call,
+# and a circuit breaker so a model that failed is not tried again for a while.
+MAX_ATTEMPTS = 2
+# Quota gets its own, larger attempt budget. A 503 either clears immediately or
+# is worth abandoning for another model; a rate limit only clears by waiting,
+# and abandoning the call wastes the two model calls already spent on the
+# ticket. Patience is cheaper than a lost fixture.
+QUOTA_MAX_ATTEMPTS = 4
+BACKOFF_BASE_SECONDS = 1.0
+CALL_DEADLINE_SECONDS = 60.0
+CIRCUIT_COOLDOWN_SECONDS = 120.0
+
+# model -> monotonic time at which it may be tried again
+_circuit: dict[str, float] = {}
+
+
+def _circuit_open(model: str) -> bool:
+    return _circuit.get(model, 0.0) > time.monotonic()
+
+
+def _trip_circuit(model: str) -> None:
+    _circuit[model] = time.monotonic() + CIRCUIT_COOLDOWN_SECONDS
+
+
+def circuit_state() -> dict[str, float]:
+    """Remaining cooldown per tripped model, for diagnostics."""
+    now = time.monotonic()
+    return {m: round(t - now, 1) for m, t in _circuit.items() if t > now}
 
 # Per-role model preference, best first. Free-tier capacity is shared and
 # genuinely volatile -- measured over two minutes, gemini-3.5-flash-lite went
@@ -52,8 +109,13 @@ BACKOFF_BASE_SECONDS = 1.5
 # the eval result ambiguous.
 MODEL_CHAINS = {
     "classifier": ["gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-3-flash-preview"],
+    # Responder and judge deliberately lead with DIFFERENT models. Measured:
+    # the classifier on flash-lite was never throttled while responder and judge
+    # -- both pointed at gemini-3.8-flash -- were rate limited on every fixture
+    # that reached them. Quota appears to be tracked per model family, so two
+    # roles sharing a first choice means two roles competing for one bucket.
     "responder": ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3-flash-preview"],
-    "judge": ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3-flash-preview"],
+    "judge": ["gemini-3.6-flash", "gemini-3-flash-preview", "gemini-3.8-flash"],
 }
 
 
@@ -131,13 +193,23 @@ def _get_client():
 
 
 def _call_gemini(role: str, system: str, user: str, schema: dict | None) -> Any:
-    """Walk the role's model chain until one answers."""
+    """Walk the role's model chain until one answers, within a time budget."""
     chain = _chain(role)
+    deadline = time.monotonic() + CALL_DEADLINE_SECONDS
+
+    # Skip models in cooldown. If every model is cooling down, fall back to the
+    # full chain rather than failing instantly -- a blanket outage should not
+    # lock the pipeline out permanently.
+    candidates = [m for m in chain if not _circuit_open(m)] or chain
+
     errors_seen: list[str] = []
 
-    for index, model in enumerate(chain):
+    for index, model in enumerate(candidates):
+        if time.monotonic() > deadline and index > 0:
+            errors_seen.append("deadline exceeded")
+            break
         try:
-            result = _generate(model, role, system, user, schema)
+            result = _generate(model, role, system, user, schema, deadline)
             _LAST_MODEL[role] = model
             if index > 0:
                 logging.getLogger(__name__).warning(
@@ -145,9 +217,31 @@ def _call_gemini(role: str, system: str, user: str, schema: dict | None) -> Any:
                 )
             return result
         except Exception as exc:
+            if _is_quota(exc):
+                raise LLMError(
+                    f"rate limited in role {role!r} after {QUOTA_MAX_ATTEMPTS} attempts. "
+                    f"Quota is per-project, so every model shares it -- this is "
+                    f"throttling, not capacity. Raise TRIAGE_MIN_INTERVAL to pace "
+                    f"the suite more slowly."
+                ) from exc
+            if _is_network(exc):
+                raise LLMError(
+                    f"network failure in role {role!r} after {MAX_ATTEMPTS} attempts "
+                    f"({type(exc).__name__}: {exc}). Every model is unreachable, so "
+                    f"this is connectivity, not capacity."
+                ) from exc
             if not (isinstance(exc, LLMError) or _is_transient(exc) or _is_unavailable(exc)):
                 raise
-            errors_seen.append(f"{model}: {type(exc).__name__}")
+            # A model that is saturated or unreachable stays skipped, so the
+            # next 30 calls do not each rediscover it.
+            # Only capacity and unavailability say anything about THIS model.
+            if _is_unavailable(exc) or getattr(exc, "code", None) in CAPACITY_STATUS:
+                _trip_circuit(model)
+            code = getattr(exc, "code", None)
+            errors_seen.append(
+                f"{model}: {type(exc).__name__}"
+                + (f"({code})" if code is not None else "")
+            )
             continue
 
     raise LLMError(
@@ -155,7 +249,9 @@ def _call_gemini(role: str, system: str, user: str, schema: dict | None) -> Any:
     )
 
 
-def _generate(model: str, role: str, system: str, user: str, schema: dict | None) -> Any:
+def _generate(
+    model: str, role: str, system: str, user: str, schema: dict | None, deadline: float
+) -> Any:
     from google.genai import types
 
     config_kwargs: dict[str, Any] = {
@@ -179,6 +275,7 @@ def _generate(model: str, role: str, system: str, user: str, schema: dict | None
             config=types.GenerateContentConfig(**config_kwargs),
         ),
         label=f"{role}/{model}",
+        deadline=deadline,
     )
 
     text = response.text
@@ -201,6 +298,51 @@ def _is_transient(exc: Exception) -> bool:
     return False
 
 
+def _is_quota(exc: Exception) -> bool:
+    """Over the project's rate limit. Not this model's fault."""
+    from google.genai import errors
+
+    if isinstance(exc, errors.APIError):
+        return getattr(exc, "code", None) in QUOTA_STATUS
+    return False
+
+
+def _retry_after(exc: Exception) -> float | None:
+    """Honour a server-provided Retry-After when there is one."""
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None) or {}
+    for key in ("retry-after", "Retry-After"):
+        if key in headers:
+            try:
+                return float(headers[key])
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
+def _pace() -> None:
+    """Hold every request to a global minimum interval."""
+    global _last_request_at
+    gap = time.monotonic() - _last_request_at
+    if gap < MIN_REQUEST_INTERVAL_SECONDS:
+        time.sleep(MIN_REQUEST_INTERVAL_SECONDS - gap)
+    _last_request_at = time.monotonic()
+
+
+def _is_network(exc: Exception) -> bool:
+    """A transport-layer failure: DNS, connect, timeout, protocol.
+
+    Distinct from a 503 in a way that matters. A 503 is one model being busy,
+    so walking to the next model in the chain is the right move. A dropped
+    connection affects every model equally, so walking the chain just multiplies
+    the wait by three before failing anyway -- retry the same model, then give
+    up and say the network is the problem.
+    """
+    import httpx
+
+    return isinstance(exc, httpx.TransportError)
+
+
 def _is_unavailable(exc: Exception) -> bool:
     """Not worth retrying, but worth trying the next model in the chain.
 
@@ -214,25 +356,37 @@ def _is_unavailable(exc: Exception) -> bool:
     return False
 
 
-def _retry_transient(thunk, label: str):
-    """Retry `thunk` on transient API failures with exponential backoff."""
-    last: Exception | None = None
-    for attempt in range(MAX_ATTEMPTS):
+def _retry_transient(thunk, label: str, deadline: float):
+    """Retry `thunk` on transient failures, never past `deadline`.
+
+    The attempt budget depends on what went wrong: quota gets
+    QUOTA_MAX_ATTEMPTS, everything else gets MAX_ATTEMPTS.
+    """
+    attempt = 0
+    while True:
         try:
+            _pace()
             return thunk()
         except Exception as exc:
-            if not _is_transient(exc):
+            if not (_is_transient(exc) or _is_network(exc)):
                 raise
-            last = exc
-            if attempt == MAX_ATTEMPTS - 1:
+            budget = QUOTA_MAX_ATTEMPTS if _is_quota(exc) else MAX_ATTEMPTS
+            attempt += 1
+            if attempt >= budget:
                 raise
-            delay = BACKOFF_BASE_SECONDS * (2**attempt) + random.uniform(0, 0.5)
+            if _is_quota(exc):
+                # A quota signal is not a blip to retry past quickly; waiting
+                # out the window is the only thing that helps.
+                delay = _retry_after(exc) or QUOTA_BACKOFF_SECONDS
+            else:
+                delay = BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)) + random.uniform(0, 0.25)
+            if not _is_quota(exc) and time.monotonic() + delay > deadline:
+                raise  # no budget left; let the caller try the next model
             logging.getLogger(__name__).info(
                 "%s attempt %d/%d: %s; retrying in %.1fs",
                 label, attempt + 1, MAX_ATTEMPTS, type(exc).__name__, delay,
             )
             time.sleep(delay)
-    raise last  # unreachable, kept for type clarity
 
 
 def _finish_reason(response) -> str | None:

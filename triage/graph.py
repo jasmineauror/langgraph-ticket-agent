@@ -26,18 +26,24 @@ from .state import TicketState, new_state
 
 
 def _auto_reply(state: TicketState) -> TicketState:
+    decided_by = state.get("decided_by") or "classifier"
     return {
         "verdict": "SEND",
-        "trace": ["[outcome] AUTO_REPLY"],
+        "decided_by": decided_by,
+        "trace": [f"[outcome] AUTO_REPLY (decided_by={decided_by})"],
     }
 
 
 def _escalate(state: TicketState) -> TicketState:
+    # If the judge ran, it already claimed the decision. Anything unclaimed
+    # reached here via the classifier short-circuit.
+    decided_by = state.get("decided_by") or "classifier"
     reason = state.get("escalation_reason") or "flagged by classifier"
     return {
         "verdict": "ESCALATE",
+        "decided_by": decided_by,
         "escalation_reason": reason,
-        "trace": [f"[outcome] ESCALATE -- {reason}"],
+        "trace": [f"[outcome] ESCALATE (decided_by={decided_by}) -- {reason}"],
     }
 
 

@@ -40,6 +40,11 @@ class TicketState(TypedDict, total=False):
 
     # --- judge ---
     verdict: Verdict
+    # Which node produced the terminal decision. Recorded rather than inferred,
+    # because an eval that checks the outcome without checking the mechanism
+    # passes when the right answer arrives from the wrong node -- and then
+    # silently stops testing anything the day that node changes its mind.
+    decided_by: str
     escalation_reason: str
     judge_checks: dict[str, bool]
 

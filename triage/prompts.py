@@ -17,9 +17,23 @@ Assign exactly one category:
 - "abusive_or_out_of_scope": abusive or threatening language, spam, or a request \
 that has nothing to do with Meridian
 
-Also decide whether the ticket could plausibly be answered from product \
-documentation alone. Set auto_answerable to false when the ticket needs account- \
-specific action, human judgment, or a decision only a person can make."""
+Also set auto_answerable, which has one narrow meaning: whether answering this \
+ticket requires ACTION or A DECISION that only a person can take.
+
+Set auto_answerable to false when the ticket asks you to do something to an \
+account (process a refund, change a plan, delete data, reset another user's \
+access), or when it needs a judgement call a company representative must make.
+
+Set auto_answerable to TRUE for any question that is merely asking for \
+information, even if you doubt the documentation covers it. You cannot see the \
+knowledge base, so you are not in a position to judge what it contains. \
+Deciding a question is unanswerable because you personally do not know the \
+answer is exactly the failure this pipeline exists to prevent -- a later step \
+retrieves the documentation and a reviewer checks whether the answer is \
+actually grounded in it. Let them do their jobs.
+
+"Do you offer X, and what does it cost?" is a question, not an action. \
+auto_answerable is true."""
 
 CLASSIFIER_SCHEMA = {
     "type": "object",

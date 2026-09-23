@@ -20,15 +20,32 @@ from triage.graph import run_ticket
 FIXTURES_PATH = pathlib.Path(__file__).parent / "fixtures.yaml"
 FIXTURES = yaml.safe_load(FIXTURES_PATH.read_text())
 
-RESULTS: list[tuple[str, bool, list[str]]] = []
+# (fixture_id, status, detail) where status is PASS | FAIL | ERROR.
+#
+# ERROR is a separate status on purpose. An earlier version appended only after
+# the assertions ran, so a fixture that died on a rate limit never reached the
+# list -- and the summary printed "3/3 passed" while four of seven fixtures had
+# not run at all. A score whose denominator silently shrinks to the tests that
+# happened to survive is worse than no score.
+RESULTS: list[tuple[str, str, list[str]]] = []
 
 
 @pytest.mark.parametrize("fixture", FIXTURES, ids=lambda f: f["id"])
 def test_fixture(fixture, record_property):
-    state = run_ticket(fixture["ticket"].strip())
-    failures = check(fixture["assert"], state)
+    try:
+        state = run_ticket(fixture["ticket"].strip())
+    except Exception as exc:
+        RESULTS.append((fixture["id"], "ERROR", [f"{type(exc).__name__}: {exc}"]))
+        pytest.fail(
+            f"fixture {fixture['id']!r} could not be evaluated -- "
+            f"{type(exc).__name__}: {exc}\n"
+            f"This is an infrastructure failure, not a result. It says nothing "
+            f"about the prompts.",
+            pytrace=False,
+        )
 
-    RESULTS.append((fixture["id"], not failures, failures))
+    failures = check(fixture["assert"], state)
+    RESULTS.append((fixture["id"], "FAIL" if failures else "PASS", failures))
     record_property("outcome", outcome(state))
 
     if failures:

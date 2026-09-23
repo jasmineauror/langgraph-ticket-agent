@@ -89,3 +89,33 @@ def test_any_of_fails_when_no_branch_holds():
 def test_expected_reason_matches_case_insensitively():
     state = _state(verdict="ESCALATE", escalation_reason="Abusive language detected")
     assert check({"expected_reason": "abusive"}, state) == []
+
+
+def test_terminated_by_catches_the_right_answer_from_the_wrong_node():
+    """The regression this assertion exists for.
+
+    An escalation is correct here, but it came from the classifier when the
+    fixture requires the judge's grounding check to have run. Before
+    terminated_by existed, this passed.
+    """
+    state = _state(verdict="ESCALATE", decided_by="classifier")
+    failures = check({"must_escalate": True, "terminated_by": "judge"}, state)
+    assert len(failures) == 1
+    assert "classifier" in failures[0] and "judge" in failures[0]
+
+
+def test_terminated_by_passes_when_the_mechanism_matches():
+    state = _state(verdict="ESCALATE", decided_by="judge")
+    assert check({"must_escalate": True, "terminated_by": "judge"}, state) == []
+
+
+def test_must_reach_retriever_catches_a_short_circuit():
+    state = _state(verdict="ESCALATE", decided_by="classifier", retrieved=[])
+    failures = check({"must_reach_retriever": True}, state)
+    assert len(failures) == 1
+    assert "short-circuited" in failures[0]
+
+
+def test_must_reach_retriever_passes_when_chunks_were_retrieved():
+    state = _state(retrieved=[{"text": "x", "source": "a.md", "distance": 0.3}])
+    assert check({"must_reach_retriever": True}, state) == []

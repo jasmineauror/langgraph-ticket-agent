@@ -44,6 +44,20 @@ def check(assertions: dict[str, Any], state: TicketState) -> list[str]:
     if assertions.get("must_escalate") and result != "ESCALATE":
         failures.append("expected ESCALATE, got AUTO_REPLY")
 
+    if expected := assertions.get("terminated_by"):
+        actual = state.get("decided_by")
+        if actual != expected:
+            failures.append(
+                f"expected the decision to come from {expected!r}, "
+                f"but {actual!r} made it"
+            )
+
+    if assertions.get("must_reach_retriever") and not state.get("retrieved"):
+        failures.append(
+            "expected the ticket to reach the retriever, but it was "
+            "short-circuited before retrieval (max_similarity=0.0)"
+        )
+
     if expected := assertions.get("expected_category"):
         actual = state.get("category")
         if actual != expected:

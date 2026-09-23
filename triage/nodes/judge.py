@@ -30,6 +30,7 @@ def judge(state: TicketState) -> TicketState:
     if verdict == "ESCALATE" and state.get("retry_count", 0) < MAX_RETRIES:
         return {
             "verdict": "RETRY",
+            "decided_by": "judge",
             "escalation_reason": reason,
             "judge_checks": checks,
             "retry_count": state.get("retry_count", 0) + 1,
@@ -41,6 +42,7 @@ def judge(state: TicketState) -> TicketState:
 
     return {
         "verdict": verdict,
+        "decided_by": "judge",
         "escalation_reason": reason if verdict == "ESCALATE" else "",
         "judge_checks": checks,
         "trace": [
